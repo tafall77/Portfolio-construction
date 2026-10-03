@@ -1,0 +1,68 @@
+# Portfolio workspace configuration.
+# Strategy ids (the keys under `strategies`) are what you write in the `strategy` column of
+# trades.csv and cashflows.csv. Use `cash` for money that is not assigned to any strategy.
+
+portfolio:
+  name: Systematic book
+  currency: USD
+  benchmark: SPY              # Yahoo ticker; also defines the trading calendar
+  risk_free: "^IRX"           # 13-week T-bill yield from Yahoo, or a constant annual rate such as 0.04
+  inception: null             # null = date of the first cash flow / fill
+  auto_dividends: true        # credit dividends on the ex-date from Yahoo (set false if you log them yourself)
+  offline: false              # true = never download, use cached / local prices only
+  price_max_age_hours: 6
+
+strategies:
+  sma_piotroski:
+    name: SMA-200 Pullback + Piotroski F-Score
+    short: SMA-PF
+    color: "#2a78d6"
+    target_weight: 0.34
+    universe: S&P 500 stocks (point-in-time), max 5 positions, 1 per sector
+    description: Buys F-Score >= 7 stocks trading between SMA50 and SMA200; sells at SMA200, F-Score < 7 or after 1 year.
+    backtest: backtests/sma_piotroski.csv
+    expectation_start: null   # the export is already the walk-forward out-of-sample record
+
+  regime_filter:
+    name: Macro Regime Filter (unemployment x policy rate)
+    short: Regime
+    color: "#eb6834"
+    target_weight: 0.33
+    universe: S&P 500 / Nasdaq-100 (SPY, QQQ or ES, NQ) / T-bills
+    description: Walk-forward expansion confidence sets NDX / SPX / cash exposure each month.
+    backtest: backtests/regime_filter.csv
+    expectation_start: 2005-01-01   # tiers were optimised on 1986-2004; 2005+ is the untouched test window
+
+  rolling_momentum:
+    name: Rolling Time-Series Momentum
+    short: Momentum
+    color: "#1baf7a"
+    target_weight: 0.33
+    universe: S&P 500 (SPY or ES) / T-bills
+    description: Long the index when its trailing calendar-window return is positive, else T-bills.
+    backtest: backtests/rolling_momentum.csv
+    expectation_start: 2021-01-01   # lookback frozen on 2000-2020; 2021+ is out of sample
+
+# Only needed for futures or symbols whose Yahoo ticker differs from what you write in trades.csv.
+instruments:
+  ES:  {type: future, multiplier: 50, yahoo: "ES=F"}
+  MES: {type: future, multiplier: 5,  yahoo: "MES=F"}
+  NQ:  {type: future, multiplier: 20, yahoo: "NQ=F"}
+  MNQ: {type: future, multiplier: 2,  yahoo: "MNQ=F"}
+
+allocation:
+  start: null                 # analysis window start (null = where the shortest backtest starts)
+  rebalance: M                # how often sleeves are brought back to target: D, M, Q, A
+  min_weight: 0.0
+  max_weight: 0.7
+  walk_forward_lookback_years: 3
+  walk_forward_step: Q
+  bootstrap_samples: 200
+
+alerts:
+  drawdown_percentile: 0.95   # red when the live drawdown is worse than 95% of same-length backtest paths
+  return_percentile: 0.05     # red when the live return is below the 5th percentile of the cone
+  vol_ratio: 1.5              # amber when live vol > 1.5x backtest vol
+  weight_drift: 0.05          # amber when a sleeve drifts more than 5 points from target
+  tracking_error: 0.05        # amber when live vs model tracking error > 5% a year
+  correlation: 0.8            # amber when two sleeves' 63-day correlation exceeds this
