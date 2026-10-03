@@ -12,7 +12,7 @@ from . import expectations as E
 from . import metrics as M
 from .backtests import load_all
 from .config import CASH_SLEEVE, load_config
-from .journal import load_cashflows, load_marks, load_trades
+from .journal import load_cashflows, load_marks, load_trades, unbalanced_transfers
 from .ledger import build_ledger
 from .prices import PriceStore
 
@@ -119,6 +119,9 @@ class Book:
 
     def data_warnings(self) -> list[str]:
         out = list(dict.fromkeys(self._bt_warnings + self.ledger.warnings + self.store.warnings))
+        for d, v in unbalanced_transfers(self.cashflows).items():
+            out.append(f"Transfers on {d:%Y-%m-%d} net to {v:+,.2f} instead of 0: each transfer needs a matching "
+                       "row in the other sleeve (use 'Move money between strategies' in Transactions).")
         for sid in self.cfg.strategies:
             bt, live = self.backtest_returns(sid), self.live_returns().get(sid)
             if bt is not None and live is not None and len(live) and bt.index[-1] < live.index[0]:
@@ -169,6 +172,68 @@ class Book:
             df["Transfer $"] = df["Target $"] - df["Current $"]
             df["Current weight"] = df["Current $"] / total
         return df
+
+    # ---- capital ---------------------------------------------------------------------------
+    def capital_summary(self) -> pd.DataFrame:
+        """Money in and out per sleeve and for the whole book, with money- and time-weighted returns."""
+        L, cf = self.ledger, self.cashflows
+        if L.empty:
+            return pd.DataFrame()
+        asof = L.dates[-1]
+        rows = {}
+        for s in L.sleeves + ["__total__"]:
+            g = cf if s == "__total__" else cf[cf["strategy"] == s]
+            v = lambda typ, sign=None: g.loc[(g["type"] == typ) & ((g["value"] > 0) if sign == "+" else
+                                                                   (g["value"] < 0) if sign == "-" else True),
+                                             "value"].sum() if len(g) else 0.0
+            nav = L.total["nav"].iloc[-1] if s == "__total__" else L.nav[s].iloc[-1]
+            ext = g[g["external"]] if len(g) else g
+            if s == "__total__" and len(ext):          # transfers between sleeves cancel out for the book
+                ext = ext[ext["type"] != "transfer"]
+            net_in = ext["value"].sum() if len(ext) else 0.0
+            inc = L.income.sum() if s == "__total__" else L.income[s]
+            inc_total = float(inc.sum())
+            cf_fees = v("fee")
+            trade_fees = float((L.fees.sum() if s == "__total__" else L.fees[s]).sum())
+            r = self.portfolio_returns() if s == "__total__" else self.live_returns().get(s, pd.Series(dtype=float))
+            flows = ext.groupby(ext["date"].dt.normalize())["value"].sum() if len(ext) else pd.Series(dtype=float)
+            mwr = M.xirr(list(flows.index) + [asof], list(-flows.to_numpy()) + [nav])
+            yrs = ((asof - flows.index.min()).days / 365.0) if len(flows) else np.nan
+            rows["Total" if s == "__total__" else self.label(s)] = {
+                "Deposited": v("deposit"), "Withdrawn": abs(v("withdrawal")),
+                "Transfers in": v("transfer", "+"), "Transfers out": abs(v("transfer", "-")),
+                "Net invested": net_in, "NAV": nav, "P&L": nav - net_in,
+                "Dividends & interest": inc_total - cf_fees, "Fees": trade_fees - cf_fees,
+                "Money-weighted return": (1 + mwr) ** yrs - 1 if np.isfinite(mwr) and yrs > 0 else np.nan,
+                "Money-weighted (ann.)": mwr,
+                "Time-weighted return": (1 + r).prod() - 1 if len(r) else np.nan,
+                "First flow": flows.index.min() if len(flows) else pd.NaT}
+        return pd.DataFrame(rows).T
+
+    def flows_by_period(self, freq: str = "M") -> pd.DataFrame:
+        """Deposits, withdrawals and net new money per period for the whole book (transfers excluded)."""
+        cf = self.cashflows
+        if cf is None or cf.empty:
+            return pd.DataFrame()
+        ext = cf[cf["type"].isin(["deposit", "withdrawal"])]
+        if ext.empty:
+            return pd.DataFrame()
+        key = ext["date"].dt.to_period(freq)
+        df = pd.DataFrame({"Deposits": ext["value"].where(ext["type"] == "deposit", 0.0).groupby(key).sum(),
+                           "Withdrawals": ext["value"].where(ext["type"] == "withdrawal", 0.0).groupby(key).sum()})
+        full = pd.period_range(df.index.min(), max(df.index.max(), pd.Timestamp.today().to_period(freq)), freq=freq)
+        df = df.reindex(full, fill_value=0.0)
+        df["Net new money"] = df["Deposits"] + df["Withdrawals"]
+        df["Cumulative net invested"] = df["Net new money"].cumsum()
+        return df
+
+    def net_invested(self, sid: str | None = None) -> pd.Series:
+        """Cumulative external flows on the ledger's dates (book level: transfers cancel)."""
+        L = self.ledger
+        if L.empty:
+            return pd.Series(dtype=float)
+        f = L.flows.sum(axis=1) if sid is None else L.flows[sid]
+        return f.cumsum()
 
     # ---- summaries ---------------------------------------------------------------------------
     def kpis(self) -> dict:

@@ -319,3 +319,21 @@ def exposure(gross: pd.DataFrame, colors: dict, labels: dict, t: Theme, title: s
                                  stackgroup="one", line=dict(width=0.8, color=c), fillcolor=_rgba(c, 0.55),
                                  hovertemplate="%{y:.1%}"))
     return layout(fig, t, title, height, yfmt=".0%")
+
+
+def flow_bars(df: pd.DataFrame, t: Theme, title: str | None = None, height: int = 300) -> go.Figure:
+    """Deposits up (cool pole) and withdrawals down (warm pole) per period, one shared zero baseline."""
+    neg, _, pos = t["div"]
+    fmt = {"M": "%b %y", "Q": None, "Y": "%Y", "A-DEC": "%Y", "Y-DEC": "%Y"}
+    f = fmt.get(getattr(df.index, "freqstr", ""), None) if isinstance(df.index, pd.PeriodIndex) else None
+    x = [i.strftime(f) if f else str(i) for i in df.index]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=x, y=df["Deposits"], name="Deposits", marker=dict(color=pos, cornerradius=4),
+                         hovertemplate="%{x}: %{y:,.0f}<extra>deposits</extra>"))
+    fig.add_trace(go.Bar(x=x, y=df["Withdrawals"], name="Withdrawals", marker=dict(color=neg, cornerradius=4),
+                         hovertemplate="%{x}: %{y:,.0f}<extra>withdrawals</extra>"))
+    layout(fig, t, title, height, yfmt=",.0f", hover="closest")
+    fig.update_layout(barmode="relative", bargap=0.45)
+    fig.add_hline(y=0, line=dict(color=t["zero"], width=1))
+    fig.update_xaxes(type="category", showgrid=False)
+    return fig

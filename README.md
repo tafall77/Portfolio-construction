@@ -48,11 +48,14 @@ python -m pcon init                     # creates data/ from templates/workspace
 2. **Export each backtest.** Paste the matching cell from [`strategy_exports/`](strategy_exports/README.md) at
    the end of each research notebook and run it. Each cell writes `data/backtests/<strategy>.csv`. The
    *Portfolio construction* and *Expected vs actual* tabs work from this point on.
-3. **Fund the sleeves.** Log a deposit per strategy (or transfers out of `cash`, the unallocated sleeve):
+3. **Fund the sleeves.** Log a deposit per strategy in the *Transactions* tab, or deposit into `cash` (the
+   unallocated sleeve) and move money to the strategies with transfers:
    ```bash
    python -m pcon cash 2026-10-05 sma_piotroski   deposit 40000
    python -m pcon cash 2026-10-05 regime_filter   deposit 30000
    python -m pcon cash 2026-10-05 rolling_momentum deposit 30000
+   python -m pcon transfer 2026-11-02 sma_piotroski rolling_momentum 5000   # writes both matching rows
+   python -m pcon capital                                                   # deposits, withdrawals, MWR vs TWR
    ```
 4. **Log every fill** in the dashboard's *Journal & data* tab, with the CLI, or by editing `data/trades.csv`
    in Excel:
@@ -70,7 +73,8 @@ machine. If you make the repository private and want the journal versioned, remo
 |---|---|
 | After each fill | Log it (form, CLI or CSV). Prices refresh from Yahoo Finance automatically (cached for 6 h). |
 | Weekly / monthly | Re-run the research notebooks with fresh data and their export cells: the *live vs model* panels then cover your live dates. |
-| Monthly / quarterly | *Portfolio construction → Rebalance*: transfers between sleeves to get back to target. Log them as `transfer` rows. |
+| Whenever money moves | *Transactions*: record deposits and withdrawals, or edit the table if something was logged wrong. |
+| Monthly / quarterly | *Portfolio construction → Rebalance*: transfers between sleeves to get back to target. Log them with *Move money between strategies*. |
 | Whenever an alert is red | *Expected vs actual*: is it bad luck (inside the cone), an execution problem (shortfall vs model), or a broken edge (outside the cone, Sharpe test significant)? |
 
 ---
@@ -85,9 +89,10 @@ machine. If you make the repository private and want the journal versioned, remo
 | **Portfolio construction** | The recommendation with a YAML snippet to adopt it. Add/remove analysis per strategy. Every subset × every method ranked in-sample and walk-forward. Weights by method, the efficient frontier, growth curves. Correlations (monthly, and on the benchmark's worst 10 % days), risk contributions, rolling correlations, drawdown attribution, crisis windows, and rebalance transfers. |
 | **Risk** | Exposure by sleeve over time. VaR/CVaR in currency from the live record and from the target mix's backtest. Holdings netted across strategies, with concentration. Rolling volatility, beta and live correlations. |
 | **Positions & trades** | Open positions with unrealised P&L. P&L attribution by position (since inception / YTD / MTD / 30 days) and fees. Closed round trips and trade statistics. Raw fills and cash flows. |
-| **Journal & data** | Forms to log fills and cash flows. Data status (which backtests are loaded, their windows, whether they cover the live period). Price sources and warnings. |
+| **Transactions** | Capital in and out. Shows total deposited, withdrawn and net invested, NAV, and P&L on your money. It gives both your **money-weighted return** (XIRR, which counts when you added or removed money) and the time-weighted return. NAV vs net invested over time, deposits and withdrawals per month, quarter or year, and capital by strategy (deposits, withdrawals, net transfers, dividends, fees). Forms to record deposits, withdrawals, income and fees, plus a *move money between strategies* form. An **editable table of every cash movement**: fix, add or delete rows, then save. Rows are validated first and the previous file is kept as `.bak`. |
+| **Journal & data** | A form to log fills and an editable table of every fill, saved the same way. Data status (which backtests are loaded, their windows, whether they cover the live period). Price sources and warnings, including transfers that don't net to zero. |
 
-The same analytics run headless: `python -m pcon summary` and `python -m pcon allocate`.
+The same analytics run headless: `python -m pcon summary`, `python -m pcon capital` and `python -m pcon allocate`.
 
 ---
 
@@ -95,7 +100,8 @@ The same analytics run headless: `python -m pcon summary` and `python -m pcon al
 
 ### Accounting (`pcon/ledger.py`)
 * **Sleeves.** Every strategy has its own cash. A buy debits the sleeve's cash and a deposit or transfer credits it. Money without a strategy goes to the `cash` sleeve.
-* **Time-weighted returns.** External flows (deposits, withdrawals, transfers) arrive at the start of the day: `r_t = NAV_t / (NAV_{t-1} + flow_t) - 1`. Adding money is never performance. Dividends, interest and fees are.
+* **Time-weighted returns.** External flows (deposits, withdrawals, transfers) arrive at the start of the day: `r_t = NAV_t / (NAV_{t-1} + flow_t) - 1`. Adding money is never performance. Dividends, interest and fees are. This is the strategy's return, comparable with its backtest.
+* **Money-weighted return** (XIRR, Excel's 365-day convention) uses the dated deposits and withdrawals plus today's NAV. It is *your* return, including the effect of when you added or removed money. Transfers between sleeves cancel out for the whole book.
 * **Splits.** Yahoo's closes are split-adjusted for the whole history, so fills are restated into today's share units. Log quantities exactly as your broker shows them on the trade date.
 * **Dividends** are credited on the ex-date to positions held at the previous close (`auto_dividends`). If you log them yourself, set it to `false`.
 * **Futures** (`type: future`, `multiplier` in `portfolio.yaml`; ES/MES/NQ/MNQ are pre-configured) are booked at notional. NAV equals margin accounting, and exposure is the notional. Rolls are a SELL and a BUY. Put your own closes in `marks.csv` when Yahoo's continuous contract does not match yours.

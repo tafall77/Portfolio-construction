@@ -4,6 +4,8 @@
     demo        generate the synthetic demo workspace (examples/demo/)
     trade       log a fill            python -m pcon trade 2026-10-05 sma_piotroski AAPL BUY 40 227.31 --fees 0.01
     cash        log a cash flow       python -m pcon cash 2026-10-01 regime_filter deposit 50000
+    transfer    move money between sleeves   python -m pcon transfer 2026-11-02 sma_piotroski rolling_momentum 5000
+    capital     deposits, withdrawals, net invested, money- and time-weighted returns per strategy
     summary     NAV, sleeves, health checks
     allocate    add/remove analysis and allocation methods (walk-forward)
     dashboard   start the Streamlit dashboard
@@ -53,6 +55,31 @@ def cmd_cash(a):
     from .journal import append_cashflow
     row = append_cashflow(load_config(a.workspace), a.date, a.strategy, a.type, a.amount, a.note)
     print("added:", row)
+
+
+def cmd_transfer(a):
+    from .config import load_config
+    from .journal import append_transfer
+    for row in append_transfer(load_config(a.workspace), a.date, a.from_strategy, a.to_strategy, a.amount, a.note):
+        print("added:", row)
+
+
+def cmd_capital(a):
+    from .book import Book
+    b = Book(a.workspace)
+    cs = b.capital_summary()
+    if cs.empty:
+        print("No cash flows yet.")
+        return
+    out = cs.drop(columns=["First flow"]).copy()
+    for c in out.columns:
+        out[c] = [(f"{v:+.2%}" if "return" in c or "(ann.)" in c else f"{v:,.0f}") if isinstance(v, (int, float)) and v == v else "-"
+                  for v in out[c]]
+    print(_fmt_table(out.T))
+    fp = b.flows_by_period("M")
+    if len(fp):
+        print("\nDeposits / withdrawals by month:")
+        print(_fmt_table(fp[(fp["Deposits"] != 0) | (fp["Withdrawals"] != 0)].round(0)))
 
 
 def cmd_summary(a):
@@ -141,7 +168,15 @@ def main(argv=None):
     s.add_argument("--note", default="")
     s.add_argument("--workspace", default=str(DEFAULT_WS))
     s.set_defaults(fn=cmd_cash)
-    for name, fn in (("summary", cmd_summary), ("allocate", cmd_allocate)):
+    s = sub.add_parser("transfer")
+    s.add_argument("date")
+    s.add_argument("from_strategy")
+    s.add_argument("to_strategy")
+    s.add_argument("amount", type=float)
+    s.add_argument("--note", default="")
+    s.add_argument("--workspace", default=str(DEFAULT_WS))
+    s.set_defaults(fn=cmd_transfer)
+    for name, fn in (("summary", cmd_summary), ("allocate", cmd_allocate), ("capital", cmd_capital)):
         s = sub.add_parser(name)
         s.add_argument("--workspace", default=str(DEFAULT_WS))
         if name == "allocate":

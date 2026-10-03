@@ -78,12 +78,11 @@ def _check_strategy(s: pd.Series, cfg: PortfolioConfig, name: str) -> pd.Series:
     return s
 
 
-def load_trades(cfg: PortfolioConfig) -> pd.DataFrame:
+def validate_trades(df: pd.DataFrame, cfg: PortfolioConfig, name: str = "trades.csv") -> pd.DataFrame:
     """Validated trades with a signed ``qty`` column (+ buy, - sell), sorted by date (stable)."""
-    df = _read(cfg.trades_path, TRADE_COLUMNS)
+    df = df.copy()
     if df.empty:
         return df.assign(qty=pd.Series(dtype=float))
-    name = cfg.trades_path.name
     df["date"] = _dates(df["date"], name)
     df["strategy"] = _check_strategy(df["strategy"], cfg, name)
     df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
@@ -91,6 +90,8 @@ def load_trades(cfg: PortfolioConfig) -> pd.DataFrame:
     bad = sorted(set(df["side"]) - set(SIDES))
     if bad:
         raise JournalError(f"{name}: side must be one of {sorted(SIDES)}, got {bad}")
+    if (df["symbol"].isin(["", "NAN", "NONE"])).any():
+        raise JournalError(f"{name}: every fill needs a symbol")
     df["quantity"] = _numbers(df["quantity"], name, "quantity").abs()
     df["price"] = _numbers(df["price"], name, "price")
     if (df["price"] <= 0).any():
@@ -102,12 +103,15 @@ def load_trades(cfg: PortfolioConfig) -> pd.DataFrame:
     return df.sort_values("date", kind="stable").reset_index(drop=True)
 
 
-def load_cashflows(cfg: PortfolioConfig) -> pd.DataFrame:
+def load_trades(cfg: PortfolioConfig) -> pd.DataFrame:
+    return validate_trades(_read(cfg.trades_path, TRADE_COLUMNS), cfg, cfg.trades_path.name)
+
+
+def validate_cashflows(df: pd.DataFrame, cfg: PortfolioConfig, name: str = "cashflows.csv") -> pd.DataFrame:
     """Validated cash flows with a signed ``value`` column and an ``external`` flag."""
-    df = _read(cfg.cashflows_path, CASH_COLUMNS)
+    df = df.copy()
     if df.empty:
         return df.assign(value=pd.Series(dtype=float), external=pd.Series(dtype=bool))
-    name = cfg.cashflows_path.name
     df["date"] = _dates(df["date"], name)
     df["strategy"] = _check_strategy(df["strategy"], cfg, name)
     df["type"] = df["type"].astype(str).str.strip().str.lower()
@@ -120,6 +124,19 @@ def load_cashflows(cfg: PortfolioConfig) -> pd.DataFrame:
     df["external"] = df["type"].isin(EXTERNAL_TYPES)
     df["note"] = df["note"].fillna("").astype(str)
     return df.sort_values("date", kind="stable").reset_index(drop=True)
+
+
+def load_cashflows(cfg: PortfolioConfig) -> pd.DataFrame:
+    return validate_cashflows(_read(cfg.cashflows_path, CASH_COLUMNS), cfg, cfg.cashflows_path.name)
+
+
+def unbalanced_transfers(cashflows: pd.DataFrame) -> pd.Series:
+    """Dates whose transfer rows do not net to zero (a transfer needs a matching row in the other sleeve)."""
+    t = cashflows[cashflows["type"] == "transfer"] if len(cashflows) else cashflows
+    if t is None or t.empty:
+        return pd.Series(dtype=float)
+    net = t.groupby(t["date"].dt.normalize())["value"].sum()
+    return net[net.abs() > 0.005]
 
 
 def load_marks(cfg: PortfolioConfig) -> pd.DataFrame:
@@ -164,6 +181,48 @@ def append_cashflow(cfg: PortfolioConfig, date, strategy: str, type_: str, amoun
                amount=float(amount), note=note)
     _append(cfg.cashflows_path, CASH_COLUMNS, row)
     return row
+
+
+def append_transfer(cfg: PortfolioConfig, date, from_strategy: str, to_strategy: str, amount: float,
+                    note: str = "") -> list[dict]:
+    """Move money between two sleeves: writes the two matching ``transfer`` rows."""
+    amount = abs(float(amount))
+    if from_strategy == to_strategy:
+        raise JournalError("a transfer needs two different sleeves")
+    if amount <= 0:
+        raise JournalError("transfer amount must be positive")
+    return [append_cashflow(cfg, date, from_strategy, "transfer", -amount, note or f"to {to_strategy}"),
+            append_cashflow(cfg, date, to_strategy, "transfer", amount, note or f"from {from_strategy}")]
+
+
+def _save(path: Path, df: pd.DataFrame, columns: list[str]) -> None:
+    out = df[columns].copy()
+    out["date"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    if path.exists():                                   # keep the previous version next to it
+        path.with_suffix(path.suffix + ".bak").write_bytes(path.read_bytes())
+    out.to_csv(path, index=False)
+
+
+def save_cashflows(cfg: PortfolioConfig, df: pd.DataFrame) -> pd.DataFrame:
+    """Validate an edited cash-flow table and overwrite ``cashflows.csv`` (previous file kept as .bak)."""
+    df = df.dropna(how="all")
+    for c in CASH_COLUMNS:
+        if c not in df.columns:
+            df[c] = "" if c == "note" else np.nan
+    v = validate_cashflows(df[CASH_COLUMNS], cfg)
+    _save(cfg.cashflows_path, v, CASH_COLUMNS)
+    return v
+
+
+def save_trades(cfg: PortfolioConfig, df: pd.DataFrame) -> pd.DataFrame:
+    """Validate an edited fills table and overwrite ``trades.csv`` (previous file kept as .bak)."""
+    df = df.dropna(how="all")
+    for c in TRADE_COLUMNS:
+        if c not in df.columns:
+            df[c] = "" if c == "note" else (0.0 if c == "fees" else np.nan)
+    v = validate_trades(df[TRADE_COLUMNS], cfg)
+    _save(cfg.trades_path, v, TRADE_COLUMNS)
+    return v
 
 
 def init_files(root: Path) -> None:

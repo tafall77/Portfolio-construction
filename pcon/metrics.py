@@ -161,6 +161,28 @@ def expected_max_sharpe(n_trials: int, sr_std_annual: float) -> float:
                                   + EULER_GAMMA * stats.norm.ppf(1 - 1 / (n_trials * np.e))))
 
 
+def xirr(dates, amounts) -> float:
+    """Annualised money-weighted return (XIRR).
+
+    ``amounts`` are from the investor's side: deposits negative, withdrawals and the final value positive.
+    """
+    from scipy.optimize import brentq
+    d = pd.DatetimeIndex(pd.to_datetime(dates))
+    a = np.asarray(amounts, dtype=float)
+    ok = np.isfinite(a) & (np.abs(a) > 0)
+    d, a = d[ok], a[ok]
+    if len(a) < 2 or not (a > 0).any() or not (a < 0).any():
+        return np.nan
+    t = np.asarray((d - d.min()).days, dtype=float) / 365.0          # Excel XIRR convention
+    if t.max() <= 0:
+        return np.nan
+    f = lambda r: float(np.sum(a / (1 + r) ** t))
+    try:
+        return float(brentq(f, -0.9999, 1000.0, maxiter=500))
+    except (ValueError, RuntimeError):
+        return np.nan
+
+
 def beta_alpha(r: pd.Series, bench: pd.Series, rf: pd.Series | None = None) -> tuple[float, float, float]:
     """(beta, annualised alpha, correlation) of excess returns vs the benchmark's excess returns."""
     r = _clean(r)

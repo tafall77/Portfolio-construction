@@ -25,7 +25,8 @@ from pcon import metrics as M  # noqa: E402
 from pcon.book import Book  # noqa: E402
 from pcon.config import CASH_SLEEVE  # noqa: E402
 from pcon.demo import build_demo  # noqa: E402
-from pcon.journal import FLOW_TYPES, SIDES, JournalError, append_cashflow, append_trade  # noqa: E402
+from pcon.journal import (CASH_COLUMNS, FLOW_TYPES, SIDES, TRADE_COLUMNS, JournalError,  # noqa: E402
+                          append_cashflow, append_trade, append_transfer, save_cashflows, save_trades)
 from pcon.workspace import init_workspace  # noqa: E402
 
 st.set_page_config(page_title="Portfolio construction", page_icon="📈", layout="wide")
@@ -236,7 +237,7 @@ with st.expander(f"Health checks: {LEVEL_ICON['red']} {n_red} red · {LEVEL_ICON
         st.markdown(f"{LEVEL_ICON[h['level']]} **{h['scope']}**: {h['msg']}")
 
 tabs = st.tabs(["Overview", "Strategies", "Expected vs actual", "Portfolio construction", "Risk",
-                "Positions & trades", "Journal & data"])
+                "Positions & trades", "Transactions", "Journal & data"])
 
 
 # ------------------------------------------------------------------------------------------------
@@ -838,10 +839,138 @@ def page_positions():
 # ------------------------------------------------------------------------------------------------
 # 7. journal & data
 # ------------------------------------------------------------------------------------------------
+FLOW_HELP = {"deposit": "money into a sleeve (positive amount)", "withdrawal": "money out (positive amount)",
+             "transfer": "between sleeves: + into this one, - out of it", "dividend": "income (if not auto-credited)",
+             "interest": "income on cash", "fee": "expense not tied to a fill"}
+
+
+def _editor_key(name: str, path: Path) -> str:
+    """A new widget after every save, so stale edits are never re-applied to the reloaded file."""
+    return f"{name}_{path.stat().st_mtime_ns if path.exists() else 0}"
+
+
+def page_transactions():
+    cs = book.capital_summary()
+    if cs.empty:
+        st.info("No deposits yet. Log the money you put into each strategy below: every sleeve needs a deposit "
+                "(or a transfer from the unallocated `cash` sleeve) before its first buy.")
+    else:
+        tot = cs.loc["Total"]
+        c = st.columns(6)
+        c[0].metric("Deposited", compact(tot["Deposited"], cur), border=True, help=money(tot["Deposited"], cur))
+        c[1].metric("Withdrawn", compact(tot["Withdrawn"], cur), border=True, help=money(tot["Withdrawn"], cur))
+        c[2].metric("Net invested", compact(tot["Net invested"], cur), border=True,
+                    help="Deposits minus withdrawals. Transfers between strategies do not change it.")
+        c[3].metric("NAV", compact(tot["NAV"], cur), border=True, help=money(tot["NAV"], cur))
+        c[4].metric("P&L", compact(tot["P&L"], cur),
+                    pct(tot["P&L"] / tot["Net invested"]) + " on capital" if tot["Net invested"] else None,
+                    border=True, help="NAV minus net invested capital.")
+        c[5].metric("Money-weighted", pct(tot["Money-weighted return"]),
+                    f"TWR {pct(tot['Time-weighted return'])}", delta_color="off", border=True,
+                    help="Money-weighted (XIRR) counts *when* you added or removed money: it is your personal "
+                         f"return. Annualised: {pct(tot['Money-weighted (ann.)'])}. Time-weighted strips the timing "
+                         "out: it is the strategy's return, comparable with the backtest.")
+
+        a, b = st.columns([1.5, 1])
+        with a:
+            scope = st.selectbox("Capital curve", ["__total__"] + [s for s in L.sleeves],
+                                 format_func=lambda s: "Whole book" if s == "__total__" else LABELS.get(s, s))
+            nav = L.total["nav"] if scope == "__total__" else L.nav[scope]
+            flows = L.total["flows"] if scope == "__total__" else L.flows[scope]
+            chart(C.nav_chart(nav, flows, T, "NAV vs net invested capital (the gap is your P&L)"), "tx_nav")
+        with b:
+            freq = st.radio("Period", ["M", "Q", "Y"], horizontal=True,
+                            format_func={"M": "Monthly", "Q": "Quarterly", "Y": "Yearly"}.get)
+            fp = book.flows_by_period(freq)
+            if len(fp):
+                chart(C.flow_bars(fp, T, "Deposits and withdrawals (whole book)", height=300), "tx_bars")
+            else:
+                st.caption("No deposits or withdrawals yet.")
+
+        st.subheader("Capital by strategy")
+        disp = cs.copy()
+        disp.insert(2, "Transfers (net)", disp["Transfers in"] - disp["Transfers out"])
+        disp = disp.drop(columns=["First flow", "Transfers in", "Transfers out", "Money-weighted (ann.)"]).rename(
+            columns={"Money-weighted return": "Money-weighted", "Time-weighted return": "Time-weighted"})
+        money_cols = ["Deposited", "Withdrawn", "Transfers (net)", "Net invested", "NAV", "P&L",
+                      "Dividends & interest", "Fees"]
+        st.dataframe(disp.style.format({**{k: (lambda v: money(v, cur)) for k in money_cols},
+                                        "Money-weighted": "{:+.2%}", "Time-weighted": "{:+.2%}"}, na_rep="–"))
+        st.caption("Transfers move money between strategies: they change each sleeve's capital but not the book's. "
+                   "Dividends, interest and fees are performance, not capital. *Money-weighted* counts when money "
+                   "went in or out (your personal return); *time-weighted* does not (the strategy's return, "
+                   "comparable with its backtest).")
+        if len(fp):
+            with st.expander("Flows per period"):
+                st.dataframe(fp.rename(index=str).style.format(lambda v: money(v, cur)))
+
+    st.subheader("Record a cash movement")
+    a, b = st.columns(2)
+    with a:
+        with st.form("cash", clear_on_submit=True):
+            st.markdown("**Deposit, withdrawal, dividend, interest or fee**")
+            c1, c2 = st.columns(2)
+            d = c1.date_input("Date", value=date.today(), key="cf_d")
+            sid = c2.selectbox("Strategy sleeve", SIDS + [CASH_SLEEVE], format_func=lambda s: LABELS.get(s, s),
+                               key="cf_s")
+            c1, c2 = st.columns(2)
+            typ = c1.selectbox("Type", ["deposit", "withdrawal", "dividend", "interest", "fee"],
+                               format_func=lambda t_: f"{t_}: {FLOW_HELP[t_]}")
+            amt = c2.number_input("Amount", min_value=0.0, step=100.0, format="%.2f")
+            note = st.text_input("Note", key="cf_n", placeholder="bank reference, reason ...")
+            if st.form_submit_button("Add", type="primary"):
+                try:
+                    append_cashflow(cfg, d, sid, typ, amt, note)
+                    st.rerun()
+                except JournalError as exc:
+                    st.error(str(exc))
+    with b:
+        with st.form("transfer", clear_on_submit=True):
+            st.markdown("**Move money between strategies**")
+            c1, c2 = st.columns(2)
+            d = c1.date_input("Date", value=date.today(), key="tr_d")
+            amt = c2.number_input("Amount", min_value=0.0, step=100.0, format="%.2f", key="tr_a")
+            c1, c2 = st.columns(2)
+            src = c1.selectbox("From", SIDS + [CASH_SLEEVE], format_func=lambda s: LABELS.get(s, s), key="tr_f")
+            dst = c2.selectbox("To", SIDS + [CASH_SLEEVE], index=min(1, len(SIDS)),
+                               format_func=lambda s: LABELS.get(s, s), key="tr_t")
+            note = st.text_input("Note", key="tr_n", placeholder="rebalance, ...")
+            if st.form_submit_button("Transfer", type="primary"):
+                try:
+                    append_transfer(cfg, d, src, dst, amt, note)
+                    st.rerun()
+                except JournalError as exc:
+                    st.error(str(exc))
+        st.caption("Writes the two matching `transfer` rows. Use the `Unallocated` (cash) sleeve for money you "
+                   "deposited into the account but have not given to a strategy yet.")
+
+    st.subheader("All cash movements")
+    st.caption("Edit cells, add rows at the bottom or select rows and delete them, then **Save**. Every row is "
+               "validated before anything is written, and the previous file is kept as `cashflows.csv.bak`.")
+    raw = book.cashflows[CASH_COLUMNS].copy() if len(book.cashflows) else pd.DataFrame(columns=CASH_COLUMNS)
+    raw["date"] = pd.to_datetime(raw["date"]).dt.date
+    raw["amount"] = pd.to_numeric(raw["amount"], errors="coerce")
+    edited = st.data_editor(
+        raw, num_rows="dynamic", hide_index=True, key=_editor_key("cf_editor", cfg.cashflows_path),
+        column_config={
+            "date": st.column_config.DateColumn("date", required=True, format="YYYY-MM-DD"),
+            "strategy": st.column_config.SelectboxColumn("strategy", options=SIDS + [CASH_SLEEVE], required=True),
+            "type": st.column_config.SelectboxColumn("type", options=sorted(FLOW_TYPES), required=True),
+            "amount": st.column_config.NumberColumn("amount", format="%.2f", required=True),
+            "note": st.column_config.TextColumn("note")})
+    if st.button("Save cash movements", type="primary"):
+        try:
+            save_cashflows(cfg, edited)
+            st.success("Saved.")
+            st.rerun()
+        except JournalError as exc:
+            st.error(f"Not saved: {exc}")
+
+
 def page_journal():
     if cfg.demo:
         st.caption("Entries added here go to the demo workspace's CSV files.")
-    a, b = st.columns(2)
+    a, b = st.columns([1, 1.2])
     with a:
         st.subheader("Log a fill")
         with st.form("trade", clear_on_submit=True):
@@ -864,52 +993,59 @@ def page_journal():
                     st.rerun()
                 except JournalError as exc:
                     st.error(str(exc))
+        st.caption("Quantities and prices exactly as your broker shows them on the trade date (splits are "
+                   "handled automatically). Deposits and transfers live in the **Transactions** tab.")
     with b:
-        st.subheader("Log a cash flow")
-        with st.form("cash", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            d = c1.date_input("Date", value=date.today(), key="cf_d")
-            sid = c2.selectbox("Strategy sleeve", SIDS + [CASH_SLEEVE], format_func=lambda s: LABELS.get(s, s),
-                               key="cf_s")
-            c1, c2 = st.columns(2)
-            typ = c1.selectbox("Type", sorted(FLOW_TYPES), index=sorted(FLOW_TYPES).index("deposit"))
-            amt = c2.number_input("Amount", step=100.0, format="%.2f",
-                                  help="Deposits/withdrawals: positive amount. Transfers: + into this sleeve, "
-                                       "- out of it (log both sides).")
-            note = st.text_input("Note", key="cf_n")
-            if st.form_submit_button("Add cash flow", type="primary"):
-                try:
-                    append_cashflow(cfg, d, sid, typ, amt, note)
-                    st.success("Cash flow added.")
-                    st.rerun()
-                except JournalError as exc:
-                    st.error(str(exc))
-        st.caption("Each strategy is a sleeve with its own cash: fund it with a deposit (or a transfer from another "
-                   "sleeve) before its first buy. Deposits, withdrawals and transfers are removed from returns "
-                   "(time-weighted); dividends, interest and fees count as performance.")
+        st.subheader("Data status")
+        rows = []
+        for s in SIDS:
+            bt = book.backtest_returns(s)
+            sc = cfg.strategies[s]
+            rows.append({"Strategy": LABELS[s], "Backtest file": sc.backtest.name if sc.backtest else "–",
+                         "Loaded": "yes" if bt is not None else "no",
+                         "From": bt.index[0] if bt is not None else pd.NaT,
+                         "To": bt.index[-1] if bt is not None else pd.NaT,
+                         "Expectation from": sc.expectation_start,
+                         "Covers live period": "yes" if book.model_on_live_dates(s) is not None else "no"})
+        st.dataframe(pd.DataFrame(rows).set_index("Strategy").style.format(
+            {"From": lambda v: "–" if pd.isna(v) else f"{v:%Y-%m-%d}",
+             "To": lambda v: "–" if pd.isna(v) else f"{v:%Y-%m-%d}",
+             "Expectation from": lambda v: "whole export" if v is None or pd.isna(v) else f"{v:%Y-%m-%d}"}))
+        if book.store.sources:
+            st.caption("Price sources: " + ", ".join(f"{k} ({v})" for k, v in sorted(book.store.sources.items())))
+        for w in book.data_warnings():
+            st.markdown(f"ℹ️ {w}")
 
-    st.subheader("Data status")
-    rows = []
-    for s in SIDS:
-        bt = book.backtest_returns(s)
-        sc = cfg.strategies[s]
-        rows.append({"Strategy": LABELS[s], "Backtest file": sc.backtest.name if sc.backtest else "–",
-                     "Loaded": "yes" if bt is not None else "no",
-                     "From": bt.index[0] if bt is not None else pd.NaT, "To": bt.index[-1] if bt is not None else pd.NaT,
-                     "Expectation from": sc.expectation_start,
-                     "Covers live period": "yes" if book.model_on_live_dates(s) is not None else "no"})
-    st.dataframe(pd.DataFrame(rows).set_index("Strategy").style.format(
-        {"From": lambda v: "–" if pd.isna(v) else f"{v:%Y-%m-%d}", "To": lambda v: "–" if pd.isna(v) else f"{v:%Y-%m-%d}",
-         "Expectation from": lambda v: "whole export" if v is None or pd.isna(v) else f"{v:%Y-%m-%d}"}))
-    if book.store.sources:
-        st.caption("Price sources: " + ", ".join(f"{k} ({v})" for k, v in sorted(book.store.sources.items())))
-    for w in book.data_warnings():
-        st.markdown(f"ℹ️ {w}")
+    st.subheader("All fills")
+    st.caption("Fix a typo, add or delete rows, then **Save**. Rows are validated first; the previous file is kept "
+               "as `trades.csv.bak`.")
+    raw = book.trades[TRADE_COLUMNS].copy() if len(book.trades) else pd.DataFrame(columns=TRADE_COLUMNS)
+    raw["date"] = pd.to_datetime(raw["date"]).dt.date
+    for c_ in ("quantity", "price", "fees"):
+        raw[c_] = pd.to_numeric(raw[c_], errors="coerce")
+    edited = st.data_editor(
+        raw, num_rows="dynamic", hide_index=True, key=_editor_key("tr_editor", cfg.trades_path),
+        column_config={
+            "date": st.column_config.DateColumn("date", required=True, format="YYYY-MM-DD"),
+            "strategy": st.column_config.SelectboxColumn("strategy", options=SIDS + [CASH_SLEEVE], required=True),
+            "symbol": st.column_config.TextColumn("symbol", required=True),
+            "side": st.column_config.SelectboxColumn("side", options=list(SIDES), required=True),
+            "quantity": st.column_config.NumberColumn("quantity", min_value=0.0, format="%.4f", required=True),
+            "price": st.column_config.NumberColumn("price", min_value=0.0, format="%.4f", required=True),
+            "fees": st.column_config.NumberColumn("fees", min_value=0.0, format="%.2f"),
+            "note": st.column_config.TextColumn("note")})
+    if st.button("Save fills", type="primary"):
+        try:
+            save_trades(cfg, edited)
+            st.success("Saved.")
+            st.rerun()
+        except JournalError as exc:
+            st.error(f"Not saved: {exc}")
     st.caption(f"Files: `{cfg.trades_path}` · `{cfg.cashflows_path}` · `{cfg.marks_path}` · "
                f"`{cfg.root / 'backtests'}`. Editing them in Excel works too; the dashboard reloads on save.")
 
 
 for tab, page in zip(tabs, [page_overview, page_strategies, page_expected, page_construction, page_risk,
-                            page_positions, page_journal]):
+                            page_positions, page_transactions, page_journal]):
     with tab:
         page()

@@ -76,4 +76,4 @@ def test_streamlit_app_runs_on_demo(demo):
     at = AppTest.from_file(str(ROOT / "dashboard" / "app.py"), default_timeout=600)
     at.run()
     assert not at.exception, [e.message for e in at.exception]
-    assert len(at.tabs) == 7
+    assert len(at.tabs) == 8
