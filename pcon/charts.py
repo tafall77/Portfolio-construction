@@ -253,10 +253,10 @@ def weights_by_method(W: pd.DataFrame, colors: dict, labels: dict, t: Theme, tit
                              marker=dict(color=t.series(colors.get(col, "#898781")),
                                          line=dict(color=t["surface"], width=2)),
                              text=[f"{v:.0%}" if v >= 0.08 else "" for v in W[col]], textposition="inside",
-                             insidetextanchor="middle", textfont=dict(color="#ffffff", size=11),
+                             insidetextanchor="middle", textangle=0, textfont=dict(color="#ffffff", size=11),
                              hovertemplate="%{y}: %{x:.1%}<extra>" + labels.get(col, col) + "</extra>"))
     layout(fig, t, title, height, xfmt=".0%", hover="closest")
-    fig.update_layout(barmode="stack", bargap=0.35)
+    fig.update_layout(barmode="stack", bargap=0.35, legend_traceorder="normal")
     fig.update_yaxes(autorange="reversed", showgrid=False)
     fig.update_xaxes(range=[0, 1])
     _left_margin(fig, W.index)
@@ -264,13 +264,14 @@ def weights_by_method(W: pd.DataFrame, colors: dict, labels: dict, t: Theme, tit
 
 
 def frontier(front: pd.DataFrame, cloud: pd.DataFrame, points: dict[str, tuple[float, float, str]], t: Theme,
-             title: str | None = None, height: int = 400) -> go.Figure:
-    """Risk/return plane: random long-only mixes, the efficient frontier and labelled portfolios."""
+             title: str | None = None, height: int = 400, frontier_name: str = "Efficient frontier",
+             cloud_name: str = "Random mixes") -> go.Figure:
+    """Risk/return plane: random mixes inside the weight bounds, the efficient frontier and labelled portfolios."""
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=cloud["Volatility"], y=cloud["Excess return"], mode="markers", name="Random mixes",
+    fig.add_trace(go.Scatter(x=cloud["Volatility"], y=cloud["Excess return"], mode="markers", name=cloud_name,
                              marker=dict(size=4, color=_rgba("#898781", 0.25)), hoverinfo="skip"))
     if len(front):
-        fig.add_trace(_line(front["Volatility"], front["Excess return"], "Efficient frontier", t["ink2"], 1.6,
+        fig.add_trace(_line(front["Volatility"], front["Excess return"], frontier_name, t["ink2"], 1.6,
                             hoverfmt=".1%"))
     for name, (vol, ret, color) in points.items():
         fig.add_trace(go.Scatter(x=[vol], y=[ret], mode="markers+text", name=name, text=[name],
@@ -295,8 +296,9 @@ def hbar(values: pd.Series, t: Theme, title: str | None = None, fmt: str = ",.0f
     cols = colors or [pos if x >= 0 else neg for x in v]
     fig = go.Figure(go.Bar(y=[str(i) for i in v.index], x=v, orientation="h", width=0.6,
                            marker=dict(color=cols, cornerradius=4),
-                           text=[format(x, fmt) for x in v], textposition="outside",
-                           textfont=dict(color=t["ink2"], size=11),
+                           text=[format(x, fmt) for x in v], textposition="auto", cliponaxis=False,
+                           insidetextfont=dict(color="#ffffff", size=11),
+                           outsidetextfont=dict(color=t["ink2"], size=11),
                            hovertemplate="%{y}: %{x:" + fmt + "}<extra></extra>"))
     layout(fig, t, title, height or max(160, 40 + 26 * len(v)), legend=False, hover="closest")
     fig.add_vline(x=0, line=dict(color=t["zero"], width=1))
@@ -304,7 +306,7 @@ def hbar(values: pd.Series, t: Theme, title: str | None = None, fmt: str = ",.0f
     fig.update_xaxes(tickformat=fmt)
     _left_margin(fig, v.index)
     lo_, hi_ = float(min(v.min(), 0)), float(max(v.max(), 0))
-    pad = (hi_ - lo_) * 0.18 or 1.0
+    pad = (hi_ - lo_) * 0.3 or 1.0                      # room for labels outside the short bars
     fig.update_xaxes(range=[lo_ - (pad if lo_ < 0 else 0), hi_ + (pad if hi_ > 0 else 0)])
     return fig
 

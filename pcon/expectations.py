@@ -41,14 +41,37 @@ def simulate(r: pd.Series, horizon: int, n_paths: int = 2000, block: int = 63, s
     return x[block_indices(len(x), horizon, n_paths, block, seed)]
 
 
-def _path_stats(sims: np.ndarray, rf_daily: np.ndarray | float = 0.0) -> dict[str, np.ndarray]:
+MIN_SHARPE_DAYS = 126   # below ~6 months (two bootstrap blocks) a live Sharpe percentile is not meaningful
+
+
+def _excess(expected: pd.Series, rf: pd.Series | None) -> pd.Series:
+    """Backtest excess returns: the expectation is resampled in excess terms and re-based to today's rates."""
+    r = M._clean(expected)
+    return r - (rf.reindex(r.index).fillna(0.0) if rf is not None else 0.0)
+
+
+def _rf_path(rf: pd.Series | None, dates: pd.DatetimeIndex) -> np.ndarray:
+    """Daily risk-free return on ``dates``; dates beyond the data use the latest known rate."""
+    if rf is None or rf.dropna().empty:
+        return np.zeros(len(dates))
+    r = rf.dropna()
+    return r.reindex(r.index.union(dates)).ffill().reindex(dates).fillna(float(r.iloc[-1])).to_numpy()
+
+
+def _path_stats(sims_ex: np.ndarray, rf_path: np.ndarray | float = 0.0,
+                sd_floor: float = 0.0) -> dict[str, np.ndarray]:
+    """Metrics of simulated paths. ``sims_ex`` are excess returns; total returns = excess + ``rf_path``.
+
+    The path Sharpe uses ``max(std, sd_floor)`` so near-all-cash paths cannot produce absurd values.
+    """
+    sims = sims_ex + rf_path
     eq = np.cumprod(1 + sims, axis=1)
     peak = np.maximum(np.maximum.accumulate(eq, axis=1), 1.0)
     dd = eq / peak - 1
-    ex = sims - rf_daily
     sd = sims.std(axis=1, ddof=1) if sims.shape[1] > 1 else np.full(len(sims), np.nan)
+    sd_ex = sims_ex.std(axis=1, ddof=1) if sims.shape[1] > 1 else np.full(len(sims), np.nan)
     with np.errstate(invalid="ignore", divide="ignore"):
-        sr = ex.mean(axis=1) / ex.std(axis=1, ddof=1) * np.sqrt(TD)
+        sr = sims_ex.mean(axis=1) / np.maximum(sd_ex, sd_floor) * np.sqrt(TD)
     return {"Return": eq[:, -1] - 1, "Volatility": sd * np.sqrt(TD), "Sharpe": sr, "Max drawdown": dd.min(axis=1),
             "Current drawdown": dd[:, -1], "% positive days": (sims > 0).mean(axis=1)}
 
@@ -70,29 +93,34 @@ def expectation_window(bt: pd.Series, start, live_start) -> pd.Series:
     return r
 
 
-def cone(expected: pd.Series, dates: pd.DatetimeIndex, n_paths: int = 2000, block: int = 63,
-         quantiles=QUANTILES, start_value: float = 1.0) -> pd.DataFrame:
-    """Quantiles of cumulative wealth along ``dates`` (wealth = ``start_value`` the day before ``dates[0]``)."""
-    sims = simulate(expected, len(dates), n_paths, block)
+def cone(expected: pd.Series, dates: pd.DatetimeIndex, rf: pd.Series | None = None, n_paths: int = 2000,
+         block: int = 63, quantiles=QUANTILES, start_value: float = 1.0) -> pd.DataFrame:
+    """Quantiles of cumulative wealth along ``dates`` (wealth = ``start_value`` the day before ``dates[0]``).
+
+    The backtest's excess returns are resampled and the risk-free rate of ``dates`` is added back."""
+    sims = simulate(_excess(expected, rf), len(dates), n_paths, block)
     if sims.size == 0:
         return pd.DataFrame(index=dates)
-    eq = start_value * np.cumprod(1 + sims, axis=1)
+    eq = start_value * np.cumprod(1 + sims + _rf_path(rf, dates)[None, :], axis=1)
     q = np.quantile(eq, quantiles, axis=0).T
     return pd.DataFrame(q, index=dates, columns=[f"p{int(x * 100)}" for x in quantiles])
 
 
-def forward_cone(expected: pd.Series, last_date, start_value: float, days: int = 252, n_paths: int = 2000,
-                 block: int = 63) -> pd.DataFrame:
+def forward_cone(expected: pd.Series, last_date, start_value: float, rf: pd.Series | None = None, days: int = 252,
+                 n_paths: int = 2000, block: int = 63) -> pd.DataFrame:
     dates = pd.bdate_range(pd.Timestamp(last_date) + pd.Timedelta(days=1), periods=days)
-    return cone(expected, dates, n_paths, block, start_value=start_value)
+    return cone(expected, dates, rf, n_paths, block, start_value=start_value)
 
 
-def forward_risk(expected: pd.Series, days: int = 252, n_paths: int = 4000, block: int = 63) -> dict:
-    """What to expect over the next ``days``: loss probability and drawdown quantiles."""
-    sims = simulate(expected, days, n_paths, block)
+def forward_risk(expected: pd.Series, rf: pd.Series | None = None, days: int = 252, n_paths: int = 4000,
+                 block: int = 63) -> dict:
+    """What to expect over the next ``days`` at today's T-bill rate: loss probability and drawdown quantiles."""
+    ex = _excess(expected, rf)
+    sims = simulate(ex, days, n_paths, block)
     if sims.size == 0:
         return {}
-    st = _path_stats(sims)
+    rf_now = float(rf.dropna().iloc[-1]) if rf is not None and len(rf.dropna()) else 0.0
+    st = _path_stats(sims, rf_now)
     return {"P(loss)": float((st["Return"] < 0).mean()),
             "Median return": float(np.median(st["Return"])),
             "5% worst return": float(np.quantile(st["Return"], 0.05)),
@@ -116,7 +144,7 @@ GOOD_HIGH = {"Return": True, "Volatility": None, "Sharpe": True, "Max drawdown":
 
 def _status(metric: str, pct: float) -> str:
     if not np.isfinite(pct):
-        return "n/a"
+        return "Too early" if metric == "Sharpe" else "n/a"
     direction = GOOD_HIGH.get(metric)
     if direction is None:              # volatility: both tails are a surprise
         return "In line" if 0.05 <= pct <= 0.95 else ("Lower than expected" if pct < 0.05 else "Higher than expected")
@@ -131,15 +159,21 @@ def _status(metric: str, pct: float) -> str:
 
 def compare(live: pd.Series, expected: pd.Series, rf_live: pd.Series | None = None,
             rf_expected: pd.Series | None = None, n_paths: int = 3000, block: int = 63) -> Comparison | None:
-    """Place the live record inside the distribution of same-length backtest paths."""
+    """Place the live record inside the distribution of same-length backtest paths.
+
+    The backtest's excess returns are bootstrapped and the live period's risk-free rate is added back, so a
+    cash-heavy strategy is judged at today's T-bill rate rather than the backtest's. The Sharpe percentile is
+    reported only once the record covers ``MIN_SHARPE_DAYS``.
+    """
     live = M._clean(live)
     expected = M._clean(expected)
     if len(live) < 2 or len(expected) < 60:
         return None
     H = len(live)
     rf_l = (rf_live.reindex(live.index).fillna(0).to_numpy() if rf_live is not None else np.zeros(H))
-    sims = simulate(expected, H, n_paths, block)
-    dist = _path_stats(sims, rf_l[None, :])
+    ex = _excess(expected, rf_expected)
+    sims = simulate(ex, H, n_paths, block)
+    dist = _path_stats(sims, rf_l[None, :], sd_floor=0.1 * float(ex.std()))
     w = (1 + live).cumprod()
     dd = w / w.cummax().clip(lower=1.0) - 1
     actual = {"Return": w.iloc[-1] - 1, "Volatility": live.std() * np.sqrt(TD) if H > 1 else np.nan,
@@ -149,6 +183,8 @@ def compare(live: pd.Series, expected: pd.Series, rf_live: pd.Series | None = No
     for k, d in dist.items():
         d = d[np.isfinite(d)]
         pct = percentile_of(actual[k], d)
+        if k == "Sharpe" and H < MIN_SHARPE_DAYS:
+            pct = np.nan
         rows[k] = {"Expected": np.median(d) if len(d) else np.nan,
                    "Low (5%)": np.quantile(d, 0.05) if len(d) else np.nan,
                    "High (95%)": np.quantile(d, 0.95) if len(d) else np.nan,
@@ -159,18 +195,30 @@ def compare(live: pd.Series, expected: pd.Series, rf_live: pd.Series | None = No
 
 
 def sharpe_consistency(live: pd.Series, expected: pd.Series, rf_live=None, rf_expected=None) -> dict:
-    """Is the live Sharpe statistically different from the backtest Sharpe? And how long until we know?"""
+    """Is the live Sharpe statistically different from the backtest Sharpe? And how long until we know?
+
+    Both Sharpe ratios are estimates, so the z-test uses sqrt(SE_live^2 + SE_backtest^2) (non-normal SEs).
+    """
     from scipy import stats
     live = M._clean(live)
     if len(live) < 10:
         return {}
-    sr_bt = M.sharpe(expected, rf_expected)
-    ex = (live - M._rf_for(live, rf_live)).to_numpy()
-    sr_d = ex.mean() / ex.std(ddof=1) if ex.std(ddof=1) > 0 else np.nan
-    se = M.sharpe_std_error(sr_d, len(ex), stats.skew(ex), stats.kurtosis(ex, fisher=False)) * np.sqrt(TD)
-    sr_live = sr_d * np.sqrt(TD)
-    z = (sr_live - sr_bt) / se if se > 0 else np.nan
-    return {"Live Sharpe": sr_live, "Backtest Sharpe": sr_bt, "Std error (live)": se,
+
+    def sr_se(r, rf):
+        x = (r - M._rf_for(r, rf)).to_numpy()
+        sd = x.std(ddof=1)
+        if len(x) < 10 or sd <= 0:
+            return np.nan, np.nan
+        sr = x.mean() / sd
+        se = M.sharpe_std_error(sr, len(x), stats.skew(x), stats.kurtosis(x, fisher=False))
+        return sr * np.sqrt(TD), se * np.sqrt(TD)
+
+    sr_live, se_live = sr_se(live, rf_live)
+    sr_bt, se_bt = sr_se(M._clean(expected), rf_expected)
+    se = np.sqrt(se_live ** 2 + se_bt ** 2)
+    z = (sr_live - sr_bt) / se if np.isfinite(se) and se > 0 else np.nan
+    return {"Live Sharpe": sr_live, "Backtest Sharpe": sr_bt, "Std error (live)": se_live,
+            "Std error (backtest)": se_bt, "Std error (difference)": se,
             "z-score": z, "p-value (two-sided)": float(2 * stats.norm.sf(abs(z))) if np.isfinite(z) else np.nan,
             "PSR live (SR>0)": M.psr(live, rf_live),
             "PSR live (SR>backtest/2)": M.psr(live, rf_live, sr_bt / 2) if np.isfinite(sr_bt) else np.nan,

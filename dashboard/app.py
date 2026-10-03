@@ -37,7 +37,8 @@ DEMO_WS = ROOT / "examples" / "demo"
 LEVEL_ICON = {"red": "🔴", "amber": "🟠", "green": "🟢", "info": "ℹ️"}
 STATUS_ICON = {"In line": "🟢 In line", "Watch": "🟠 Watch", "Below expectations": "🔴 Below expectations",
                "Above expectations": "🔵 Above expectations", "Lower than expected": "🔵 Lower than expected",
-               "Higher than expected": "🟠 Higher than expected", "n/a": "–"}
+               "Higher than expected": "🟠 Higher than expected", "Too early": "⏳ Too early (needs ~6 months)",
+               "n/a": "–"}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -64,34 +65,45 @@ def load_book(ws: str, sig: tuple, refresh: int, day: str) -> Book:
 
 
 @st.cache_data(show_spinner="Testing every combination of strategies (walk-forward) ...", max_entries=16)
-def cached_explore(R: pd.DataFrame, rf: pd.Series, methods: tuple, rebalance: str, hi: float, target: pd.Series,
-                   wf_days: int, step: str) -> pd.DataFrame:
-    return A.explore(R, rf, methods, rebalance, 0.0, hi, target, wf_days, step, n_resamples=20)
+def cached_explore(R: pd.DataFrame, rf: pd.Series, methods: tuple, rebalance: str, lo: float, hi: float,
+                   target: pd.Series, budgets: pd.Series | None, wf_days: int, step: str) -> pd.DataFrame:
+    return A.explore(R, rf, methods, rebalance, lo, hi, target, wf_days, step, n_resamples=20, budgets=budgets)
 
 
 @st.cache_data(show_spinner="Optimising allocations ...", max_entries=16)
-def cached_methods(R: pd.DataFrame, rf: pd.Series, hi: float, target: pd.Series, rebalance: str, wf_days: int,
-                   step: str, n_resamples: int) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def cached_methods(R: pd.DataFrame, rf: pd.Series, lo: float, hi: float, target: pd.Series,
+                   budgets: pd.Series | None, rebalance: str, wf_days: int, step: str,
+                   n_resamples: int) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     W, rows, wf = {}, {}, {}
     for m in A.METHODS:
-        w = A.optimize(R, m, rf, 0.0, hi, target, n_resamples)
+        if m == "risk_budget" and budgets is None:
+            continue
+        w = A.optimize(R, m, rf, lo, hi, target, n_resamples, budgets=budgets)
         W[m] = w
         r = A.portfolio_returns(R, w, rebalance)
         s = A.stats_row(r, rf)
         if m in ("equal", "target"):
-            r_wf = r.iloc[wf_days:]
+            r_wf, turnover = r.iloc[wf_days:], 0.0
         else:
-            r_wf, _ = A.walk_forward(R, m, rf, wf_days, step, rebalance, 0.0, hi, target, 30)
+            r_wf, Wh = A.walk_forward(R, m, rf, wf_days, step, rebalance, lo, hi, target, 30, budgets)
+            turnover = A.weight_turnover(Wh)
         s_wf = A.stats_row(r_wf, rf)
         rows[m] = {**s, **{f"WF {k}": v for k, v in s_wf.items() if k in ("CAGR", "Sharpe", "Max drawdown",
-                                                                             "Calmar")}}
+                                                                             "Calmar")},
+                   "Weight turnover / quarter": turnover}
         wf[m] = r_wf
     return pd.DataFrame(W).T, pd.DataFrame(rows).T, wf
 
 
+@st.cache_data(show_spinner="Bootstrapping weight uncertainty ...", max_entries=16)
+def cached_uncertainty(R, rf, lo, hi, budgets):
+    return A.weight_uncertainty(R, ("risk_parity", "min_variance", "max_sharpe"), rf, lo, hi, n=60,
+                                budgets=budgets)
+
+
 @st.cache_data(show_spinner=False, max_entries=16)
-def cached_marginal(R, rf, method, rebalance, hi, target):
-    return A.marginal(R, rf, method, rebalance, 0.0, hi, target)
+def cached_marginal(R, rf, method, rebalance, lo, hi, target, budgets):
+    return A.marginal(R, rf, method, rebalance, lo, hi, target, budgets=budgets)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -139,6 +151,28 @@ def compact(v, cur="$"):
 
 def num(v, d=2):
     return "–" if v is None or not np.isfinite(v) else f"{v:,.{d}f}"
+
+
+def table(df: pd.DataFrame, fmt, style=None, **kwargs):
+    """``st.dataframe(df.style.format(fmt))`` with missing numbers shown as '–'.
+
+    Streamlit draws a null cell as a grey 'None' whatever the Styler's ``na_rep``, so a float column with gaps is
+    sent as text ('–' in the gaps, numbers still formatted by ``fmt`` and right-aligned). ``style`` gets the Styler
+    and the original numeric frame, for colouring rules.
+    """
+    gaps = [c for c in df.columns if df[c].dtype.kind == "f" and df[c].isna().any()]
+    shown = df.astype({c: object for c in gaps})
+    for c in gaps:
+        shown[c] = shown[c].where(df[c].notna(), "–")
+    fmt = fmt if isinstance(fmt, dict) else {c: fmt for c in df.columns}
+
+    def safe(f):
+        return lambda v: v if isinstance(v, str) else f.format(v) if isinstance(f, str) else f(v)
+    sty = shown.style.format({c: safe(f) for c, f in fmt.items() if c in shown.columns})
+    if style is not None:
+        sty = style(sty, df)
+    config = {c: st.column_config.Column(alignment="right") for c in gaps} | kwargs.pop("column_config", {})
+    st.dataframe(sty, column_config=config, **kwargs)
 
 
 def diverging_bg(v, lim: float = 0.4) -> str:
@@ -345,10 +379,9 @@ def page_overview():
             "vs model": tr["Implementation shortfall"] if tr else np.nan,
             "Final tests": tests_label(s) if s in cfg.strategies else "–"})
     df = pd.DataFrame(rows).set_index("Strategy")
-    st.dataframe(df.style.format({"NAV": lambda v: money(v, cur), "Weight": "{:.1%}", "Target": "{:.0%}",
-                                  "Return (live)": "{:.2%}", "Volatility": "{:.1%}", "Sharpe": "{:.2f}",
-                                  "Max DD": "{:.1%}", "Pctile vs expected": "{:.0%}",
-                                  "vs model": "{:+.2%}"}, na_rep="–"))
+    table(df, {"NAV": lambda v: money(v, cur), "Weight": "{:.1%}", "Target": "{:.0%}", "Return (live)": "{:.2%}",
+               "Volatility": "{:.1%}", "Sharpe": "{:.2f}", "Max DD": "{:.1%}", "Pctile vs expected": "{:.0%}",
+               "vs model": "{:+.2%}"})
     st.caption("*Pctile vs expected*: where the live return sits among same-length backtest paths (50% = as "
                "expected). *vs model*: live minus the backtest on the same days (execution shortfall). *Final "
                "tests*: how many of the research notebook's final tests the exported configuration passed.")
@@ -404,10 +437,9 @@ def page_strategies():
     if len(op) and (op["strategy"] == sid).any():
         st.markdown("**Open positions**")
         o = op[op["strategy"] == sid].drop(columns=["strategy"]).set_index("symbol")
-        st.dataframe(o.style.format({"quantity": "{:,.4g}", "avg_cost": "{:,.2f}", "last": "{:,.2f}",
-                                     "market_value": "{:,.0f}", "unrealized": "{:+,.0f}", "unrealized_pct": "{:+.2%}",
-                                     "realized": "{:+,.0f}", "weight_sleeve": "{:.1%}",
-                                     "entry_date": "{:%Y-%m-%d}"}, na_rep="–"))
+        table(o, {"quantity": "{:,.4g}", "avg_cost": "{:,.2f}", "last": "{:,.2f}", "market_value": "{:,.0f}",
+                  "unrealized": "{:+,.0f}", "unrealized_pct": "{:+.2%}", "realized": "{:+,.0f}",
+                  "weight_sleeve": "{:.1%}", "entry_date": "{:%Y-%m-%d}"})
     rt = L.round_trips
     if len(rt) and (rt["strategy"] == sid).any():
         g = rt[rt["strategy"] == sid]
@@ -476,18 +508,18 @@ def page_expected():
         return
     if live is None or len(live) < 2:
         st.info("No live record yet: showing what to expect over the next 12 months.")
-        fwd = E.forward_cone(exp, pd.Timestamp.today(), 1.0)
+        fwd = E.forward_cone(exp, pd.Timestamp.today(), 1.0, book.rf)
         chart(C.cone(pd.DataFrame(), None, T, color, "Expected range, next 12 months", forward=fwd), "ex_fwd_only")
-        fr = E.forward_risk(exp)
+        fr = E.forward_risk(exp, book.rf)
         st.dataframe(pd.Series({k_: pct(v) for k_, v in fr.items()}, name="next 12 months"))
         return
     cmp_ = book.comparison(sid)
     a, b = st.columns([1.7, 1])
     with a:
         show_fwd = st.toggle("Project the cone 12 months forward", value=True)
-        cn = E.cone(exp, live.index)
+        cn = E.cone(exp, live.index, book.rf)
         last_w = float((1 + live).prod())
-        fwd = E.forward_cone(exp, live.index[-1], last_w) if show_fwd else None
+        fwd = E.forward_cone(exp, live.index[-1], last_w, book.rf) if show_fwd else None
         chart(C.cone(cn, live, T, color, "Live path inside the backtest's expectation cone", forward=fwd,
                      height=400), f"ex_cone_{scope}")
     with b:
@@ -503,7 +535,7 @@ def page_expected():
             st.markdown("**Is the live Sharpe consistent with the backtest?**")
             st.markdown(
                 f"Live **{num(stt['Live Sharpe'])}** vs backtest **{num(stt['Backtest Sharpe'])}** "
-                f"(standard error of the live estimate ±{num(stt['Std error (live)'])}). "
+                f"(standard error of the difference ±{num(stt['Std error (difference)'])}, counting both estimates). "
                 f"z = {num(stt['z-score'])}, p = {num(stt['p-value (two-sided)'])}: "
                 + ("**no evidence the edge has changed**." if stt["p-value (two-sided)"] > 0.05 else
                    "**the live Sharpe is statistically different from the backtest**.")
@@ -534,7 +566,7 @@ def page_expected():
                             "% positive days", "% positive months", "Worst day", "Skew", "Excess kurtosis"])
     with b:
         st.markdown("**What to expect over the next 12 months** (from the backtest)")
-        fr = E.forward_risk(exp)
+        fr = E.forward_risk(exp, book.rf)
         nav_now = (L.total["nav"].iloc[-1] if sid is None else L.nav[sid].iloc[-1])
         st.dataframe(pd.DataFrame({"share": [pct(v) for v in fr.values()],
                                    cfg.currency: [money(v * nav_now, cur) if "P(" not in k_ else "–"
@@ -577,41 +609,59 @@ def page_construction():
         return
     rf = book.rf.reindex(R.index).fillna(0.0)
     target = cfg.target_weights().reindex(R.columns).fillna(0.0)
+    budgets = cfg.risk_budgets()
+    budgets = budgets.reindex(R.columns).fillna(0.0) if budgets is not None else None
+    lo = cfg.allocation.min_weight
     wf_days = int(wf_years * 252)
+    n = R.shape[1]
+    lo_used, hi_used, relaxed = A.feasible_bounds(n, lo, max_w)
+    if relaxed:
+        st.warning(f"A max weight of {max_w:.0%} (min {lo:.0%}) cannot hold with {n} fully invested strategies: "
+                   f"{lo_used:.0%}-{hi_used:.0%} is used instead.", icon="⚠️")
     st.caption(f"Common window **{R.index[0]:%Y-%m-%d} → {R.index[-1]:%Y-%m-%d}** ({len(R) / 252:.1f} years, "
                f"{len(R):,} days) · strategies: {', '.join(LABELS[c] for c in R.columns)} · source: {source} · "
                f"{ {'M': 'monthly', 'Q': 'quarterly', 'A': 'annual', 'D': 'daily'}[rebalance]} rebalancing · "
-               f"max weight {max_w:.0%}. Walk-forward = weights estimated on the trailing {wf_years:g} years only, "
-               "held for the next quarter.")
+               f"weights {lo_used:.0%}-{hi_used:.0%}. Walk-forward = weights estimated on the trailing "
+               f"{wf_years:g} years only, held for the next quarter.")
 
-    W, stats_m, wf = cached_methods(R, rf, max_w, target, rebalance, wf_days, "Q", cfg.allocation.bootstrap_samples)
+    W, stats_m, wf = cached_methods(R, rf, lo, max_w, target, budgets, rebalance, wf_days, "Q",
+                                    cfg.allocation.bootstrap_samples)
     best_wf = stats_m["WF Sharpe"].astype(float).idxmax()
     rec = "resampled" if stats_m.loc["resampled", "WF Sharpe"] >= stats_m.loc[best_wf, "WF Sharpe"] - 0.05 else best_wf
+    r_t = A.portfolio_returns(R, W.loc["target"], rebalance)
+    r_r = A.portfolio_returns(R, W.loc[rec], rebalance)
 
     # ---- recommendation ----------------------------------------------------------------------
     st.subheader("Recommendation")
-    r_t = A.portfolio_returns(R, W.loc["target"], rebalance)
-    r_r = A.portfolio_returns(R, W.loc[rec], rebalance)
-    test = cached_sharpe_test(r_r, r_t, rf)
-    mg = cached_marginal(R, rf, "target", rebalance, max_w, target)
-    drop = [LABELS[i] for i, v in mg["Verdict"].items() if str(v).startswith("Removal")]
+    test = cached_sharpe_test(wf[rec], wf["target"], rf) if rec != "target" and len(wf[rec]) else {}
+    mg = cached_marginal(R, rf, "target", rebalance, lo, max_w, target, budgets)
+    drop = [LABELS[i] for i, v in mg["Verdict"].items() if str(v).startswith("Removal candidate")]
+    dv_t = A.diversification(R, W.loc["target"], book.bench if len(book.bench) else None)
     c = st.columns([1.2, 1])
     with c[0]:
+        sig = ""
+        if test and np.isfinite(test.get("p_not_better", np.nan)):
+            sig = (f"; out of sample the improvement is "
+                   f"{'statistically meaningful' if test['p_not_better'] < 0.1 else 'not statistically significant'} "
+                   f"(P(no improvement) = {pct(test['p_not_better'], 0)})")
         st.markdown(
             f"- **Allocation method:** *{A.METHODS[rec]}* "
             f"(walk-forward Sharpe {num(stats_m.loc[rec, 'WF Sharpe'])} vs {num(stats_m.loc['target', 'WF Sharpe'])} "
             f"for your targets; the best out-of-sample method was *{A.METHODS[best_wf]}*).\n"
             f"- **Weights:** " + ", ".join(f"{LABELS[k_]} **{v:.0%}**" for k_, v in W.loc[rec].items()) + "\n"
-            f"- **vs your targets:** Sharpe {num(stats_m.loc[rec, 'Sharpe'])} vs {num(stats_m.loc['target', 'Sharpe'])}, "
-            f"max drawdown {pct(stats_m.loc[rec, 'Max drawdown'])} vs {pct(stats_m.loc['target', 'Max drawdown'])}"
-            + (f"; the improvement is {'statistically meaningful' if test.get('p_not_better', 1) < 0.1 else 'not statistically significant'} "
-               f"(P(no improvement) = {pct(test.get('p_not_better'), 0)})." if test else ".") + "\n"
-            + (f"- **Strategies the data would drop:** {', '.join(drop)} (see the add/remove table: removal is "
-               "only worth acting on when it is significant)." if drop else
-               "- **Every strategy earns its place** at your target weights (each one raises the portfolio Sharpe).")
+            f"- **Out of sample vs your targets:** Sharpe {num(stats_m.loc[rec, 'WF Sharpe'])} vs "
+            f"{num(stats_m.loc['target', 'WF Sharpe'])}, max drawdown {pct(stats_m.loc[rec, 'WF Max drawdown'])} vs "
+            f"{pct(stats_m.loc['target', 'WF Max drawdown'])}{sig}.\n"
+            + (f"- **Strategies the data would drop:** {', '.join(drop)} (removal is only worth acting on when it "
+               "is significant)." if drop else
+               "- **No strategy is a removal candidate** at your target weights.") + "\n"
+            + (f"- **Diversification:** the book holds about **{dv_t['Effective number of bets']:.1f} independent "
+               f"bets**" + (f"; {dv_t['Share of variance from benchmark beta']:.0%} of its variance is "
+                            f"{cfg.benchmark} beta" if "Share of variance from benchmark beta" in dv_t else "")
+               + " (see section 3).")
         )
-        st.caption("Optimised weights are estimates. Prefer the walk-forward columns and the resampled allocation "
-                   "over in-sample maximum-Sharpe weights, which overfit.")
+        st.caption("Optimised weights are estimates. The recommendation and its significance test use the "
+                   "walk-forward (out-of-sample) record, never in-sample maximum-Sharpe weights, which overfit.")
     with c[1]:
         yaml_snip = "\n".join(f"  {k_}:\n    target_weight: {v:.2f}" for k_, v in W.loc[rec].items())
         st.markdown("To adopt it, set in `portfolio.yaml`:")
@@ -625,15 +675,15 @@ def page_construction():
                 "that including it does **not** help.")
     mgd = mg.copy()
     mgd.index = [LABELS[i] for i in mgd.index]
-    st.dataframe(mgd.style.format({"Sharpe alone": "{:.2f}", "CAGR alone": "{:.1%}", "Max DD alone": "{:.1%}",
-                                   "Corr to rest": "{:.2f}", "Hurdle Sharpe": "{:.2f}", "Sharpe without": "{:.2f}",
-                                   "Sharpe with": "{:.2f}", "Δ Sharpe": "{:+.2f}", "Δ CAGR": "{:+.1%}",
-                                   "Δ Max DD": "{:+.1%}", "Weight": "{:.0%}", "P(no improvement)": "{:.0%}"},
-                                  na_rep="–"))
+    table(mgd, {"Sharpe alone": "{:.2f}", "CAGR alone": "{:.1%}", "Max DD alone": "{:.1%}", "Corr to rest": "{:.2f}",
+                "Hurdle Sharpe": "{:.2f}", "Sharpe without": "{:.2f}", "Sharpe with": "{:.2f}", "Δ Sharpe": "{:+.2f}",
+                "Δ CAGR": "{:+.1%}", "Δ Max DD": "{:+.1%}", "Weight": "{:.0%}", "P(no improvement)": "{:.0%}"})
     st.caption("Δ columns = with minus without the strategy. Δ Max DD > 0 means a shallower drawdown with it. "
-               "*P(no improvement)* below 10% = the gain is statistically meaningful; above 90% = removing it is.")
-    methods = ("target", "equal", "inverse_vol", "risk_parity", "min_variance", "max_sharpe", "resampled")
-    ex = cached_explore(R, rf, methods, rebalance, max_w, target, wf_days, "Q")
+               "*P(no improvement)* below 10% = the gain is statistically meaningful; above 90% = removing it is. "
+               "A strategy that passes the hurdle but lowers Sharpe at its current weight is over-weighted, not "
+               "useless: keep it at a smaller weight.")
+    methods = tuple(m for m in A.METHODS if m != "risk_budget" or budgets is not None)
+    ex = cached_explore(R, rf, methods, rebalance, lo, max_w, target, budgets, wf_days, "Q")
     obj = st.selectbox("Rank combinations by", ["WF Sharpe", "Sharpe", "WF CAGR", "CAGR", "Calmar",
                                                  "WF Max drawdown", "Max drawdown", "Sortino"], index=0)
     exd = ex.copy()
@@ -649,40 +699,82 @@ def page_construction():
         pc = {c_: "{:.0%}" for c_ in LABELS.values()} | {k_: "{:.1%}" for k_ in ("CAGR", "Volatility", "Max drawdown",
                                                                                   "Worst month", "% positive months",
                                                                                   "WF CAGR", "WF Max drawdown")}
-        pc |= {k_: "{:.2f}" for k_ in ("Sharpe", "Sortino", "Calmar", "WF Sharpe")}
-        st.dataframe(exd.drop(columns=["n"]).style.format(pc, na_rep="–"), hide_index=True, height=420)
+        pc |= {k_: "{:.2f}" for k_ in ("Sharpe", "Sortino", "Calmar", "WF Sharpe")} | {"Max weight used": "{:.0%}"}
+        table(exd.drop(columns=["n"]), pc, hide_index=True, height=420)
+    if (ex["Max weight used"] > hi_used + 1e-9).any():
+        st.caption(f"*Max weight used*: for 2-strategy subsets a cap below 50% cannot hold, so 50% is applied.")
 
     # ---- how much each -------------------------------------------------------------------------
     st.subheader("2 · How much capital to each?")
-    a, b = st.columns([1, 1.25])
+    a, b = st.columns([1, 1.35])
     with a:
         Wd = W.rename(index=A.METHODS)
-        chart(C.weights_by_method(Wd, COLORS, LABELS, T, "Weights by allocation method", height=340), "pc_wm")
+        chart(C.weights_by_method(Wd, COLORS, LABELS, T, "Weights by allocation method", height=380), "pc_wm")
     with b:
-        sm = stats_m.rename(index=A.METHODS)[["CAGR", "Volatility", "Sharpe", "Max drawdown", "Calmar",
-                                              "WF CAGR", "WF Sharpe", "WF Max drawdown"]]
-        st.dataframe(sm.style.format({"CAGR": "{:.1%}", "Volatility": "{:.1%}", "Sharpe": "{:.2f}",
-                                      "Max drawdown": "{:.1%}", "Calmar": "{:.2f}", "WF CAGR": "{:.1%}",
-                                      "WF Sharpe": "{:.2f}", "WF Max drawdown": "{:.1%}"}, na_rep="–")
-                     .highlight_max(subset=["WF Sharpe"], color=C._rgba("#2a78d6", 0.18)), height=320)
-        st.caption("In-sample columns use weights fitted on the whole window (optimistic). WF columns are the honest "
-                   "out-of-sample record of each method.")
+        sm = stats_m.rename(index=A.METHODS)[["CAGR", "Volatility", "Sharpe", "Max drawdown", "WF CAGR", "WF Sharpe",
+                                              "WF Max drawdown", "Weight turnover / quarter"]]
+        best = f"background-color: {C._rgba('#2a78d6', 0.18)}"
+        table(sm, {"CAGR": "{:.1%}", "Volatility": "{:.1%}", "Sharpe": "{:.2f}", "Max drawdown": "{:.1%}",
+                   "WF CAGR": "{:.1%}", "WF Sharpe": "{:.2f}", "WF Max drawdown": "{:.1%}",
+                   "Weight turnover / quarter": "{:.1%}"}, height=390,
+              style=lambda sty, d: sty.apply(lambda col: np.where(d["WF Sharpe"] == d["WF Sharpe"].max(), best, ""),
+                                             subset=["WF Sharpe"]))
+        st.caption("In-sample columns use weights fitted on the whole window (optimistic). WF columns are each "
+                   "method's honest out-of-sample record; *turnover* is how much its weights move at each quarterly "
+                   "re-estimate (high = the method is chasing noise).")
+    unc = cached_uncertainty(R, rf, lo, max_w, budgets)
+    unc["cell"] = [f"{r.p50:.0%}  ({r.p5:.0%}–{r.p95:.0%})" for r in unc.itertuples()]
+    ut = unc.pivot(index="method", columns="strategy", values="cell").rename(index=A.METHODS, columns=LABELS)
+    st.markdown("**How stable are the weights?** Median and 90% range of each method's weights re-optimised on "
+                "60 resampled histories:")
+    st.dataframe(ut)
     a, b = st.columns(2)
     with a:
-        fr, cloud = A.efficient_frontier(R, rf, 0.0, max_w)
+        fr, cloud = A.efficient_frontier(R, rf, lo, max_w)
         mu, cov = A.estimate(R, rf)
         pts = {LABELS[c_]: (float(np.sqrt(cov[i, i])), float(mu[i]), COLORS[c_]) for i, c_ in enumerate(R.columns)}
         for m, col in (("target", "portfolio"), (rec, C.MODEL)):
             w = W.loc[m].to_numpy()
             pts[A.METHODS[m]] = (float(np.sqrt(w @ cov @ w)), float(w @ mu), col)
-        chart(C.frontier(fr, cloud, pts, T, "Risk / return of every long-only mix"), "pc_front")
+        chart(C.frontier(fr, cloud, pts, T, f"Risk / return of every mix with weights {lo_used:.0%}-{hi_used:.0%}",
+                         frontier_name=f"Efficient frontier (max weight {hi_used:.0%})",
+                         cloud_name="Random mixes within the bounds"), "pc_front")
     with b:
         ser = {"Your targets": (r_t, "portfolio"), A.METHODS[rec]: (r_r, C.MODEL)}
         ser |= {LABELS[c_]: (R[c_], COLORS[c_]) for c_ in R.columns}
         chart(C.growth(ser, T, "Growth of 1 over the window (log)", log=True, height=400), "pc_growth")
 
-    # ---- risk budget ---------------------------------------------------------------------------
-    st.subheader("3 · Diversification and risk budget")
+    # ---- independent bets --------------------------------------------------------------------
+    st.subheader("3 · How many independent bets does the book hold?")
+    dv_r = A.diversification(R, W.loc[rec], book.bench if len(book.bench) else None)
+    keys = ["Effective number of bets", "Diversification ratio", "Effective risk contributors", "Beta to benchmark",
+            "Share of variance from benchmark beta"]
+    dtab = pd.DataFrame({"Your targets": {k_: dv_t.get(k_) for k_ in keys},
+                         A.METHODS[rec]: {k_: dv_r.get(k_) for k_ in keys}}).rename(
+        index={"Beta to benchmark": f"Beta to {cfg.benchmark}",
+               "Share of variance from benchmark beta": f"Share of variance that is {cfg.benchmark} beta"})
+    a, b = st.columns([1, 1])
+    with a:
+        table(dtab.astype(float), "{:.2f}",
+              style=lambda sty, d: sty.format(lambda v: v if isinstance(v, str) else f"{v:.0%}",
+                                              subset=pd.IndexSlice[[d.index[-1]], :]))
+        enb = dv_t.get("Effective number of bets", np.nan)
+        st.caption(f"With {n} strategies the maximum is {n} bets. *Effective number of bets* (Meucci) counts "
+                   "independent sources of variance; *diversification ratio* = average strategy vol / portfolio "
+                   "vol (1 = none). Risk parity spreads volatility evenly across the sleeves, but it cannot create "
+                   "bets that are not there.")
+        if np.isfinite(enb) and enb < 1.8 and n >= 3:
+            st.info(f"Your {n} strategies behave like about **{enb:.1f} independent bets**"
+                    + (f": {dv_t['Share of variance from benchmark beta']:.0%} of the book's variance is "
+                       f"{cfg.benchmark} beta" if "Share of variance from benchmark beta" in dv_t else "")
+                    + ". All of them are long US equity with different timing rules, so they lose together in "
+                      "sharp sell-offs. The next strategy that would add real diversification is one with low "
+                      "equity beta (other asset classes, market-neutral or short-biased).", icon="ℹ️")
+    with b:
+        if "Strategy betas" in dv_t:
+            bt_tab = pd.DataFrame({f"Beta to {cfg.benchmark}": dv_t["Strategy betas"],
+                                   f"R² vs {cfg.benchmark}": dv_t["Strategy R2 vs benchmark"]}).rename(index=LABELS)
+            st.dataframe(bt_tab.style.format({bt_tab.columns[0]: "{:.2f}", bt_tab.columns[1]: "{:.0%}"}))
     a, b, c3 = st.columns(3)
     with a:
         chart(C.corr_heatmap(A.correlations(R, "M"), LABELS, T, "Correlation (monthly returns)"), "pc_corr_m")
@@ -693,9 +785,12 @@ def page_construction():
         else:
             chart(C.corr_heatmap(A.correlations(R, "D"), LABELS, T, "Correlation (daily)"), "pc_corr_d")
     with c3:
-        rc = pd.concat({"Your targets": A.risk_contributions(R, W.loc["target"])["% of risk"],
-                        A.METHODS[rec]: A.risk_contributions(R, W.loc[rec])["% of risk"]}, axis=1).T
-        chart(C.weights_by_method(rc, COLORS, LABELS, T, "Share of portfolio volatility", height=300), "pc_rc")
+        rcs = {"Your targets": A.risk_contributions(R, W.loc["target"])["% of risk"],
+               A.METHODS[rec]: A.risk_contributions(R, W.loc[rec])["% of risk"]}
+        if budgets is not None:
+            rcs["Your risk budgets (goal)"] = budgets / budgets.sum()
+        chart(C.weights_by_method(pd.concat(rcs, axis=1).T, COLORS, LABELS, T, "Share of portfolio volatility",
+                                  height=300), "pc_rc")
     rcor = A.rolling_correlations(R, 126)
     rcor.columns = [" / ".join(LABELS[x] for x in c_.split(" / ")) for c_ in rcor.columns]
     pair_colors = dict(zip(rcor.columns, ["#eda100", "#e87ba4", "#4a3aa7", "#008300", "#e34948", "#52514e"]))
@@ -705,31 +800,73 @@ def page_construction():
     if len(dc):
         st.caption(f"Worst drawdown of the target mix ({dc['peak'].iloc[0]:%Y-%m-%d} → {dc['trough'].iloc[0]:%Y-%m-%d}): "
                    + ", ".join(f"{LABELS[i]} {v:.0%}" for i, v in dc["% of drawdown"].items()) + " of the loss.")
-
-    st.markdown("**Stress windows** (each strategy's full backtest where it covers the window)")
+    st.markdown("**Stress windows** (close of the first date to close of the last; each strategy's full backtest "
+                "where it covers the window)")
     full = {LABELS[s]: book.backtest_returns(s) for s in SIDS if book.backtest_returns(s) is not None}
     full["Target mix"] = r_t
     if len(book.bench):
         full[cfg.benchmark] = book.bench
     stt = A.stress_test(full).astype(float)
-    st.dataframe(stt.style.format("{:.1%}", na_rep="–").map(diverging_bg, lim=0.4) if len(stt) else stt)
+    if len(stt):
+        table(stt, "{:.1%}", style=lambda sty, d: sty.map(diverging_bg, lim=0.4))
+
+    # ---- portfolio risk level ----------------------------------------------------------------
+    st.subheader("4 · Portfolio risk level: volatility targeting")
+    st.markdown("Institutional books size the *whole* portfolio to a risk budget and use T-bills as the dial: "
+                "invest `min(cap, target ÷ forecast vol)` of the book in the strategies each month, the rest in "
+                "T-bills. The forecast is an EWMA volatility known at the previous close (no look-ahead).")
+    a, b = st.columns([1, 2])
+    with a:
+        tv = st.slider("Target volatility (0 = off)", 0.0, 0.25, float(cfg.allocation.target_vol or 0.0), 0.01,
+                       format="%.2f")
+        cap = st.slider("Maximum exposure", 0.5, 1.5, float(cfg.allocation.vol_cap), 0.05,
+                        help="1.0 = never borrow. Above 1 assumes borrowing at the T-bill rate.")
+    invest_now = 1.0
+    if tv > 0:
+        base = {"Your targets": r_t, A.METHODS[rec]: r_r}
+        rows, expo = {}, {}
+        for name, r_ in base.items():
+            scaled, e = A.vol_target(r_, tv, rf, cfg.allocation.vol_halflife, cap, "M")
+            rows[name] = A.stats_row(r_, rf)
+            rows[f"{name} + vol target"] = A.stats_row(scaled, rf)
+            expo[name] = e
+        vt = pd.DataFrame(rows).T[["CAGR", "Volatility", "Sharpe", "Max drawdown", "Calmar", "Worst month"]]
+        with b:
+            st.dataframe(vt.style.format({"CAGR": "{:.1%}", "Volatility": "{:.1%}", "Sharpe": "{:.2f}",
+                                          "Max drawdown": "{:.1%}", "Calmar": "{:.2f}", "Worst month": "{:.1%}"}))
+        e_t = expo["Your targets"]
+        sig_now = float(np.sqrt((r_t ** 2).ewm(halflife=cfg.allocation.vol_halflife).mean().iloc[-1] * 252))
+        invest_now = float(min(cap, tv / sig_now)) if sig_now > 0 else 1.0
+        chart(C.lines(pd.DataFrame({"Exposure of the target mix": e_t}), {"Exposure of the target mix": "portfolio"},
+                      T, "Share of the book invested in the strategies", yfmt=".0%", height=220), "pc_vt")
+        st.markdown(f"**Today:** forecast volatility of your target mix is **{sig_now:.1%}**, so a {tv:.0%} target "
+                    f"means investing **{invest_now:.0%}** of the book in the strategies and "
+                    f"**{max(0.0, 1 - invest_now):.0%}** in T-bills (the *Unallocated* sleeve). The rebalance below "
+                    "includes it.")
+    else:
+        with b:
+            st.caption("Off: the book is always fully invested in the strategies. Set a target (or `target_vol` in "
+                       "portfolio.yaml) to see the effect on Sharpe and drawdown.")
 
     # ---- rebalance -----------------------------------------------------------------------------
-    st.subheader("4 · Rebalance")
+    st.subheader("5 · Rebalance")
     if L.empty:
         st.info("No live sleeves yet.")
     else:
         which = st.radio("Bring sleeves to", ["Target weights (portfolio.yaml)", f"Recommended ({A.METHODS[rec]})"],
                          horizontal=True)
         tw = cfg.target_weights() if which.startswith("Target") else W.loc[rec]
-        orders = book.rebalance_orders(tw)
+        band = cfg.alerts.weight_drift
+        orders = book.rebalance_orders(tw, band=band, invest=min(invest_now, 1.0))
         a, b = st.columns([1.3, 1])
         with a:
-            st.dataframe(orders.style.format({"Current $": "{:,.0f}", "Current weight": "{:.1%}",
-                                              "Target weight": "{:.1%}", "Target $": "{:,.0f}",
-                                              "Transfer $": "{:+,.0f}"}))
-            st.caption("Move cash between sleeves with a `transfer` row per sleeve in cashflows.csv, then let each "
-                       "strategy size its next trades from its new sleeve NAV.")
+            table(orders, {"Current $": "{:,.0f}", "Current weight": "{:.1%}", "Target weight": "{:.1%}",
+                           "Target $": "{:,.0f}", "Transfer $": "{:+,.0f}"})
+            if (orders["Transfer $"].abs() < 0.5).all():
+                st.success(f"Every sleeve is within ±{band:.0%} of its target: no rebalance needed.")
+            st.caption(f"Tolerance-band rebalancing: nothing moves until a sleeve drifts more than ±{band:.0%} "
+                       "(`alerts.weight_drift`), then everything goes back to target. Record the moves with *Move "
+                       "money between strategies* in the Transactions tab.")
         with b:
             chart(C.hbar(orders["Transfer $"], T, "Transfers needed", height=60 + 40 * len(orders)), "pc_orders")
 
@@ -767,7 +904,7 @@ def page_risk():
             st.caption("Historical simulation. The backtest row uses years of data and is the more reliable one "
                        "until the live record is long.")
         if ep is not None:
-            fr = E.forward_risk(ep)
+            fr = E.forward_risk(ep, book.rf)
             st.markdown(f"Next 12 months (backtest of the target mix): probability of a loss **{pct(fr['P(loss)'], 0)}**, "
                         f"median max drawdown **{pct(fr['Median max drawdown'])}**, 1-in-20 max drawdown "
                         f"**{pct(fr['5% worst max drawdown'])}** (≈ {money(fr['5% worst max drawdown'] * nav_now, cur)}).")
@@ -825,10 +962,9 @@ def page_positions():
     if len(op):
         o = op.copy()
         o["strategy"] = o["strategy"].map(LABELS)
-        st.dataframe(o.style.format({"quantity": "{:,.4g}", "avg_cost": "{:,.2f}", "last": "{:,.2f}",
-                                     "market_value": "{:,.0f}", "unrealized": "{:+,.0f}", "unrealized_pct": "{:+.2%}",
-                                     "realized": "{:+,.0f}", "weight_sleeve": "{:.1%}", "entry_date": "{:%Y-%m-%d}"},
-                                    na_rep="–"), hide_index=True)
+        table(o, {"quantity": "{:,.4g}", "avg_cost": "{:,.2f}", "last": "{:,.2f}", "market_value": "{:,.0f}",
+                  "unrealized": "{:+,.0f}", "unrealized_pct": "{:+.2%}", "realized": "{:+,.0f}",
+                  "weight_sleeve": "{:.1%}", "entry_date": "{:%Y-%m-%d}"}, hide_index=True)
     else:
         st.caption("Flat.")
 
@@ -850,7 +986,7 @@ def page_positions():
             summ = pd.DataFrame({"Positions P&L": att.groupby("strategy")["P&L"].sum(),
                                  "Fees": -fees.rename(LABELS)})
             summ["Net"] = summ.sum(axis=1)
-            st.dataframe(summ.style.format("{:+,.0f}", na_rep="–"))
+            table(summ, "{:+,.0f}")
             st.caption(f"Dividends and interest booked in the period: {money(inc.sum(), cur)} (part of positions P&L "
                        "when auto-credited; otherwise in the sleeve's cash).")
 
@@ -931,8 +1067,8 @@ def page_transactions():
             columns={"Money-weighted return": "Money-weighted", "Time-weighted return": "Time-weighted"})
         money_cols = ["Deposited", "Withdrawn", "Transfers (net)", "Net invested", "NAV", "P&L",
                       "Dividends & interest", "Fees"]
-        st.dataframe(disp.style.format({**{k: (lambda v: money(v, cur)) for k in money_cols},
-                                        "Money-weighted": "{:+.2%}", "Time-weighted": "{:+.2%}"}, na_rep="–"))
+        table(disp, {**{k: (lambda v: money(v, cur)) for k in money_cols},
+                     "Money-weighted": "{:+.2%}", "Time-weighted": "{:+.2%}"})
         st.caption("Transfers move money between strategies: they change each sleeve's capital but not the book's. "
                    "Dividends, interest and fees are performance, not capital. *Money-weighted* counts when money "
                    "went in or out (your personal return); *time-weighted* does not (the strategy's return, "

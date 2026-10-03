@@ -114,24 +114,34 @@ def cmd_allocate(a):
         sys.exit("Need at least two strategies with backtest returns in backtests/.")
     rf = b.rf.reindex(R.index).fillna(0.0)
     tgt = b.cfg.target_weights().reindex(R.columns).fillna(0.0)
+    budgets = b.cfg.risk_budgets()
+    budgets = budgets.reindex(R.columns).fillna(0.0) if budgets is not None else None
     al = b.cfg.allocation
+    lo = al.min_weight
     print(f"Window {R.index[0]:%Y-%m-%d} -> {R.index[-1]:%Y-%m-%d} ({len(R)} days), source={a.source}\n")
-    mg = A.marginal(R, rf, "target", al.rebalance, 0.0, al.max_weight, tgt)
+    mg = A.marginal(R, rf, "target", al.rebalance, lo, al.max_weight, tgt, budgets=budgets)
     print("Add / remove analysis (at target weights):")
     print(_fmt_table(mg.round(3)))
     rows, W = {}, {}
     for m in A.METHODS:
-        w = A.optimize(R, m, rf, 0.0, al.max_weight, tgt, 100)
+        if m == "risk_budget" and budgets is None:
+            continue
+        w = A.optimize(R, m, rf, lo, al.max_weight, tgt, 100, budgets=budgets)
         W[m] = w
         s = A.stats_row(A.portfolio_returns(R, w, al.rebalance), rf)
         wf = A.stats_row(A.walk_forward(R, m, rf, int(al.walk_forward_lookback_years * 252), al.walk_forward_step,
-                                        al.rebalance, 0.0, al.max_weight, tgt, 30)[0], rf) \
+                                        al.rebalance, lo, al.max_weight, tgt, 30, budgets)[0], rf) \
             if m not in ("equal", "target") else A.stats_row(A.portfolio_returns(R, w, al.rebalance)
                                                              .iloc[int(al.walk_forward_lookback_years * 252):], rf)
         rows[m] = {**{b.label(c): w[c] for c in R.columns}, "Sharpe": s.get("Sharpe"), "MaxDD": s.get("Max drawdown"),
                    "WF Sharpe": wf.get("Sharpe"), "WF MaxDD": wf.get("Max drawdown")}
     print("\nAllocation methods (WF = walk-forward, out of sample):")
     print(_fmt_table(pd.DataFrame(rows).T.round(3)))
+    d = A.diversification(R, tgt, b.bench if len(b.bench) else None)
+    print(f"\nAt your targets: {d['Effective number of bets']:.2f} effective bets, diversification ratio "
+          f"{d['Diversification ratio']:.2f}"
+          + (f", {d['Share of variance from benchmark beta']:.0%} of variance is {b.cfg.benchmark} beta"
+             if "Share of variance from benchmark beta" in d else ""))
 
 
 def cmd_dashboard(a):

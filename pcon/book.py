@@ -165,20 +165,29 @@ class Book:
         a = self.cfg.allocation
         return A.align(self.strategy_returns(source, strategies), start or a.start, end or a.end)
 
-    def rebalance_orders(self, target: pd.Series | None = None) -> pd.DataFrame:
+    def rebalance_orders(self, target: pd.Series | None = None, band: float | None = None,
+                         invest: float = 1.0) -> pd.DataFrame:
+        """Transfers that bring every sleeve to ``target`` x ``invest`` of today's total NAV.
+
+        The rest (1 - invest, e.g. from volatility targeting) belongs in the unallocated ``cash`` sleeve (T-bills);
+        money already sitting there is deployed when ``invest`` is 1. With ``band``, nothing is traded while
+        every sleeve is within ``band`` of its target.
+        """
         if self.ledger.empty:
             return pd.DataFrame()
-        tgt = self.cfg.target_weights() if target is None else target
-        nav = self.ledger.nav.iloc[-1].drop(labels=[CASH_SLEEVE], errors="ignore")
-        unalloc = self.ledger.nav.iloc[-1].get(CASH_SLEEVE, 0.0)
-        tgt = tgt.reindex(nav.index).fillna(0.0)
-        df = A.rebalance_orders(nav, tgt, {s: self.label(s) for s in nav.index})
-        if unalloc:
-            # unallocated cash is deployed in proportion to the targets
-            total = nav.sum() + unalloc
-            df["Target $"] = tgt.to_numpy() * total
-            df["Transfer $"] = df["Target $"] - df["Current $"]
-            df["Current weight"] = df["Current $"] / total
+        tgt = self.cfg.target_weights() if target is None else pd.Series(target, dtype=float)
+        tgt = tgt / tgt.sum() * invest
+        nav = self.ledger.nav.iloc[-1]
+        idx = list(tgt.index) + [CASH_SLEEVE]
+        cur = nav.reindex(idx).fillna(0.0)
+        tw = tgt.reindex(idx).fillna(0.0)
+        tw[CASH_SLEEVE] = max(0.0, 1.0 - invest)
+        df = A.rebalance_orders(cur, tw, {s: self.label(s) for s in idx}, band)
+        label = self.label(CASH_SLEEVE)
+        if abs(cur[CASH_SLEEVE]) < 0.5 and tw[CASH_SLEEVE] == 0:
+            df = df.drop(index=label)
+        elif label in df.index:
+            df = df.rename(index={label: "Unallocated / T-bills"})
         return df
 
     # ---- capital ---------------------------------------------------------------------------
@@ -205,15 +214,16 @@ class Book:
             trade_fees = float((L.fees.sum() if s == "__total__" else L.fees[s]).sum())
             r = self.portfolio_returns() if s == "__total__" else self.live_returns().get(s, pd.Series(dtype=float))
             flows = ext.groupby(ext["date"].dt.normalize())["value"].sum() if len(ext) else pd.Series(dtype=float)
-            mwr = M.xirr(list(flows.index) + [asof], list(-flows.to_numpy()) + [nav])
-            yrs = ((asof - flows.index.min()).days / 365.0) if len(flows) else np.nan
+            gross_in = flows[flows > 0].sum() if len(flows) else 0.0
+            terminal = nav if abs(nav) > max(1.0, 1e-4 * gross_in) else 0.0   # fully withdrawn: no terminal value
+            mwr_ann, mwr_period, _ = M.mwr(list(flows.index) + [asof], list(-flows.to_numpy()) + [terminal])
             rows["Total" if s == "__total__" else self.label(s)] = {
                 "Deposited": v("deposit"), "Withdrawn": abs(v("withdrawal")),
                 "Transfers in": v("transfer", "+"), "Transfers out": abs(v("transfer", "-")),
                 "Net invested": net_in, "NAV": nav, "P&L": nav - net_in,
                 "Dividends & interest": inc_total - cf_fees, "Fees": trade_fees - cf_fees,
-                "Money-weighted return": (1 + mwr) ** yrs - 1 if np.isfinite(mwr) and yrs > 0 else np.nan,
-                "Money-weighted (ann.)": mwr,
+                "Money-weighted return": mwr_period,
+                "Money-weighted (ann.)": mwr_ann,
                 "Time-weighted return": (1 + r).prod() - 1 if len(r) else np.nan,
                 "First flow": flows.index.min() if len(flows) else pd.NaT}
         return pd.DataFrame(rows).T

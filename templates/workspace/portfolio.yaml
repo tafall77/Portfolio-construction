@@ -22,6 +22,7 @@ strategies:
     description: Buys F-Score >= 7 stocks trading between SMA50 and SMA200; sells at SMA200, F-Score < 7 or after 1 year.
     backtest: backtests/sma_piotroski.csv
     expectation_start: null   # the export is already the walk-forward out-of-sample record
+    risk_budget: null         # optional: share of portfolio RISK for the 'Your risk budgets' method, e.g. 0.25
 
   regime_filter:
     name: Macro Regime Filter (unemployment x policy rate)
@@ -58,6 +59,9 @@ allocation:
   walk_forward_lookback_years: 3
   walk_forward_step: Q
   bootstrap_samples: 200
+  target_vol: null            # e.g. 0.10: scale the whole book to 10% volatility, the rest in T-bills
+  vol_halflife: 21            # EWMA half-life of the volatility estimate (trading days)
+  vol_cap: 1.0                # maximum exposure; 1.0 = never borrow
 
 alerts:
   drawdown_percentile: 0.95   # red when the live drawdown is worse than 95% of same-length backtest paths

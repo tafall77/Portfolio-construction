@@ -161,10 +161,12 @@ def expected_max_sharpe(n_trials: int, sr_std_annual: float) -> float:
                                   + EULER_GAMMA * stats.norm.ppf(1 - 1 / (n_trials * np.e))))
 
 
-def xirr(dates, amounts) -> float:
-    """Annualised money-weighted return (XIRR).
+def mwr(dates, amounts) -> tuple[float, float, float]:
+    """Money-weighted return (XIRR): (annualised rate, return over the period, years).
 
     ``amounts`` are from the investor's side: deposits negative, withdrawals and the final value positive.
+    Solved for the continuously compounded rate on a wide bracket, so very short or very large periods
+    still resolve. The period is the span of the non-zero flows actually used.
     """
     from scipy.optimize import brentq
     d = pd.DatetimeIndex(pd.to_datetime(dates))
@@ -172,15 +174,21 @@ def xirr(dates, amounts) -> float:
     ok = np.isfinite(a) & (np.abs(a) > 0)
     d, a = d[ok], a[ok]
     if len(a) < 2 or not (a > 0).any() or not (a < 0).any():
-        return np.nan
-    t = np.asarray((d - d.min()).days, dtype=float) / 365.0          # Excel XIRR convention
+        return np.nan, np.nan, np.nan
+    t = np.asarray((d - d.min()).days, dtype=float) / 365.0            # Excel XIRR convention
     if t.max() <= 0:
-        return np.nan
-    f = lambda r: float(np.sum(a / (1 + r) ** t))
+        return np.nan, np.nan, np.nan
+    f = lambda k: float(np.sum(a * np.exp(-k * t)))
     try:
-        return float(brentq(f, -0.9999, 1000.0, maxiter=500))
+        k = brentq(f, -60.0, 60.0, maxiter=500)
     except (ValueError, RuntimeError):
-        return np.nan
+        return np.nan, np.nan, float(t.max())
+    return float(np.expm1(k)), float(np.expm1(k * t.max())), float(t.max())
+
+
+def xirr(dates, amounts) -> float:
+    """Annualised money-weighted return (see ``mwr``)."""
+    return mwr(dates, amounts)[0]
 
 
 def beta_alpha(r: pd.Series, bench: pd.Series, rf: pd.Series | None = None) -> tuple[float, float, float]:

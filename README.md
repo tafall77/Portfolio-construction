@@ -91,7 +91,7 @@ machine. If you make the repository private and want the journal versioned, remo
 | **Overview** | NAV, P&L, YTD/MTD, live Sharpe, drawdown and exposure tiles. Cumulative return of the portfolio, each sleeve and the benchmark, with drawdowns. Actual vs target allocation. Health checks. A scoreboard per strategy with the percentile vs expectation and the shortfall vs model. |
 | **Strategies** | The full live metric table (CAGR, vol, Sharpe, Sortino, Calmar, VaR/CVaR, beta, alpha, capture, PSR ...). Per strategy: live vs model curves, drawdown, monthly heatmap, exposure, open positions, closed trades and trade statistics. A backtest tearsheet of the expectation window. |
 | **Expected vs actual** | The live path inside the backtest's 25-75 % / 5-95 % expectation cone, projected 12 months forward. Percentiles and status for return, volatility, Sharpe and drawdown. Histograms of the simulated distributions with the actual value marked. Sharpe consistency (z-test, PSR, minimum track record). Backtest profile vs live. Next-12-month risk in currency. Live vs model tracking: implementation shortfall, tracking error, correlation. |
-| **Portfolio construction** | The recommendation with a YAML snippet to adopt it. Add/remove analysis per strategy. Every subset × every method ranked in-sample and walk-forward. Weights by method, the efficient frontier, growth curves. Correlations (monthly, and on the benchmark's worst 10 % days), risk contributions, rolling correlations, drawdown attribution, crisis windows, and rebalance transfers. |
+| **Portfolio construction** | The recommendation, tested out of sample against your targets, with a YAML snippet to adopt it. **1 · Which strategies:** add/remove analysis per strategy, and every subset × every method ranked in-sample and walk-forward. **2 · How much capital:** weights from ten methods, how stable they are (bootstrap ranges, turnover), the efficient frontier within your caps, growth curves. **3 · How many independent bets:** effective number of bets, diversification ratio, beta and the share of variance that is just the benchmark, correlations (monthly, and on the benchmark's worst 10 % days), risk contributions vs your risk budgets, rolling correlations, drawdown attribution, crisis windows. **4 · Volatility targeting** of the whole book. **5 · Rebalance** transfers with a tolerance band. |
 | **Risk** | Exposure by sleeve over time. VaR/CVaR in currency from the live record and from the target mix's backtest. Holdings netted across strategies, with concentration. Rolling volatility, beta and live correlations. |
 | **Positions & trades** | Open positions with unrealised P&L. P&L attribution by position (since inception / YTD / MTD / 30 days) and fees. Closed round trips and trade statistics. Raw fills and cash flows. |
 | **Transactions** | Capital in and out. Shows total deposited, withdrawn and net invested, NAV, and P&L on your money. It gives both your **money-weighted return** (XIRR, which counts when you added or removed money) and the time-weighted return. NAV vs net invested over time, deposits and withdrawals per month, quarter or year, and capital by strategy (deposits, withdrawals, net transfers, dividends, fees). Forms to record deposits, withdrawals, income and fees, plus a *move money between strategies* form. An **editable table of every cash movement**: fix, add or delete rows, then save. Rows are validated first and the previous file is kept as `.bak`. |
@@ -105,8 +105,8 @@ The same analytics run headless: `python -m pcon summary`, `python -m pcon capit
 
 ### Accounting (`pcon/ledger.py`)
 * **Sleeves.** Every strategy has its own cash. A buy debits the sleeve's cash and a deposit or transfer credits it. Money without a strategy goes to the `cash` sleeve.
-* **Time-weighted returns.** External flows (deposits, withdrawals, transfers) arrive at the start of the day: `r_t = NAV_t / (NAV_{t-1} + flow_t) - 1`. Adding money is never performance. Dividends, interest and fees are. This is the strategy's return, comparable with its backtest.
-* **Money-weighted return** (XIRR, Excel's 365-day convention) uses the dated deposits and withdrawals plus today's NAV. It is *your* return, including the effect of when you added or removed money. Transfers between sleeves cancel out for the whole book.
+* **Time-weighted returns.** External money in (deposits, transfers in) arrives at the start of the day and money out (withdrawals, transfers out) leaves at the close: `r_t = (NAV_t - out_t) / (NAV_{t-1} + in_t) - 1`. Selling everything and withdrawing it the same day is therefore that day's market move, not -100 %. Adding money is never performance. Dividends, interest and fees are. A sleeve has no returns before it is first funded or after it is withdrawn to dust. This is the strategy's return, comparable with its backtest.
+* **Money-weighted return** (XIRR, 365-day year) uses the dated deposits and withdrawals plus today's NAV. It is *your* return, including the effect of when you added or removed money. Transfers between sleeves cancel out for the whole book. A sleeve that was fully withdrawn is measured up to its last withdrawal, not to today. The tiles show the return over the period, with the annualised rate in the tooltip (annualising a few weeks of returns gives absurd numbers).
 * **Splits.** Yahoo's closes are split-adjusted for the whole history, so fills are restated into today's share units. Log quantities exactly as your broker shows them on the trade date.
 * **Dividends** are credited on the ex-date to positions held at the previous close (`auto_dividends`). If you log them yourself, set it to `false`.
 * **Futures** (`type: future`, `multiplier` in `portfolio.yaml`; ES/MES/NQ/MNQ are pre-configured) are booked at notional. NAV equals margin accounting, and exposure is the notional. Rolls are a SELL and a BUY. Put your own closes in `marks.csv` when Yahoo's continuous contract does not match yours.
@@ -116,15 +116,34 @@ The same analytics run headless: `python -m pcon summary`, `python -m pcon capit
 ### Expected vs actual (`pcon/expectations.py`)
 * The **expectation** for each strategy is its exported backtest from `expectation_start` (its honest out-of-sample start) to the day before you went live. For the portfolio it is the target-weighted mix of those windows.
 * **Moving-block bootstrap** with 63-day blocks keeps volatility clustering and exposure regimes. It draws 3,000 paths with the same length as your live record. Each live metric gets a percentile in the matching distribution. *In line* is 15-95 %. *Watch* is 5-15 %. *Below expectations* is under 5 %.
-* **Sharpe consistency.** A z-test of live vs backtest Sharpe, using the standard error of the live estimate (adjusted for skew and kurtosis). It also gives the **minimum track record length**: how many years of live data at the backtest's Sharpe you need to show SR > 0 at 95 %. Expect years, not months.
+* **Rates.** Paths are resampled from the backtest's *excess* returns and then earn the live T-bill rate, so a backtest from the zero-rate years is not compared unfairly with a live record at 5 % rates.
+* **Sharpe percentile** is shown as *Too early* for the first 126 trading days: on shorter paths the Sharpe of a resampled path is mostly noise.
+* **Sharpe consistency.** A z-test of live vs backtest Sharpe. The standard error counts the uncertainty of **both** estimates (each adjusted for skew and kurtosis), so a short backtest does not make the live record look more significant than it is. It also gives the **minimum track record length**: how many years of live data at the backtest's Sharpe you need to show SR > 0 at 95 %. Expect years, not months.
 * **Live vs model** uses the backtest series on the same dates. Shortfall, tracking error and correlation measure execution: slippage, late or missed signals, sizing.
 
 ### Portfolio construction (`pcon/allocation.py`)
 * **Common window.** Inner join of the exported backtests. It starts where the shortest export starts (the SMA walk-forward record), or at `allocation.start`. Sleeves are rebalanced monthly by default, with drifting weights in between.
 * **Add/remove.** Adding a small weight of strategy *k* raises the Sharpe of portfolio *P* iff `SR_k > corr(k, P) × SR_P`. The table shows the hurdle and the actual Sharpe with and without *k*. A paired block bootstrap gives the probability that including *k* does **not** help.
-* **Methods.** Your targets, equal weight, inverse volatility, equal risk contribution, minimum variance, maximum diversification, maximum Sharpe, and resampled maximum Sharpe (the average optimum over block-bootstrap resamples, after Michaud). All are long-only with a `max_weight` cap. Covariances use Ledoit-Wolf shrinkage.
-* **Walk-forward.** Weights are estimated on the trailing `walk_forward_lookback_years` only, then held for the next quarter. The out-of-sample quarters are stitched together. In-sample maximum Sharpe always looks best, and the walk-forward columns show how much of that survives. The recommendation uses the best walk-forward method, preferring the resampled allocation when it is within 0.05 Sharpe of it.
-* **Diagnostics.** Correlations (daily, monthly, and on the benchmark's worst 10 % days), rolling correlations, Euler risk contributions, contributions to the worst drawdown, crisis windows, and the efficient frontier.
+* **Methods.** All are long-only between `min_weight` and `max_weight`, with Ledoit-Wolf shrinkage covariances. If the caps cannot add up to 100 % (e.g. three strategies capped at 20 %) the dashboard says which cap it actually used instead of quietly ignoring it.
+
+  | Method | What it does |
+  |---|---|
+  | Your targets | `target_weight` from `portfolio.yaml`. |
+  | Equal weight | 1/N. |
+  | Inverse volatility | Weights ∝ 1/vol, with capped weight redistributed in proportion. |
+  | Equal risk contribution | Every sleeve contributes the same share of portfolio volatility (risk parity, solved exactly as a convex problem). |
+  | Your risk budgets | Each sleeve contributes its `risk_budget` share of volatility (e.g. 40 / 25 / 35 %). Shown when budgets are set. |
+  | Minimum variance | Lowest volatility. |
+  | Maximum diversification | Highest ratio of average strategy vol to portfolio vol. |
+  | Minimum drawdown (CDaR) | Lowest average of the worst 5 % of drawdowns (conditional drawdown at risk, solved as a linear programme). |
+  | Maximum Sharpe | Mean-variance (Markowitz) tangency portfolio, solved as a convex problem, so it is the global optimum within the caps. |
+  | Resampled max Sharpe | The average optimum over block-bootstrap resamples (Michaud). Less sensitive to estimation error. |
+* **Walk-forward.** Weights are estimated on the trailing `walk_forward_lookback_years` only, then held for the next quarter. The out-of-sample quarters are stitched together. In-sample maximum Sharpe always looks best, and the walk-forward columns show how much of that survives. The recommendation uses the best walk-forward method, preferring the resampled allocation when it is within 0.05 Sharpe of it. Its edge over your targets is tested on those **out-of-sample** returns (paired block bootstrap), not in-sample.
+* **Weight stability.** Bootstrap 5-95 % ranges of each method's weights, and the walk-forward turnover per quarter: a method whose weights swing wildly is mostly fitting noise.
+* **Independent bets.** The *effective number of bets* (Meucci: the number of uncorrelated sources of risk after decorrelating the sleeves), the diversification ratio, each sleeve's beta and R² to the benchmark, and the share of the book's variance that is benchmark beta. Long-only US equity strategies usually turn out to be one and a half bets at most, whatever the allocation method.
+* **Volatility targeting** (`target_vol`). Each month the book invests `min(vol_cap, target_vol / forecast vol)` in the strategies and keeps the rest in T-bills (the *Unallocated* sleeve). The forecast is an EWMA volatility (`vol_halflife`) known at the previous close, so the backtest has no look-ahead. The rebalance list includes the T-bill leg.
+* **Rebalance.** Tolerance-band rebalancing: nothing trades until a sleeve drifts more than `alerts.weight_drift` from its target, then every sleeve goes back to target.
+* **Diagnostics.** Correlations (daily, monthly, and on the benchmark's worst 10 % days), rolling correlations, Euler risk contributions, contributions to the worst drawdown (adding up to its depth), crisis windows measured close to close on each strategy's full backtest, and the efficient frontier within the caps.
 
 ### Caveats
 * Backtests are estimates. Optimised weights inherit their errors, so prefer the walk-forward and resampled results and treat in-sample maximum-Sharpe weights as optimistic.
@@ -148,7 +167,7 @@ dashboard/app.py         Streamlit dashboard
 pcon/                    engine: config, journal, prices, ledger, metrics, expectations, allocation, charts, book, cli
 strategy_exports/        cells that export each research notebook's returns
 templates/workspace/     the portfolio.yaml that `python -m pcon init` copies
-tests/                   pytest suite (accounting identities, splits, futures, TWR, optimisers, walk-forward causality, app smoke test)
+tests/                   pytest suite (accounting identities, splits, futures, TWR, optimisers vs brute force, walk-forward causality, audit regressions, app smoke test)
 ```
 
 Run the tests with `pytest -q`.

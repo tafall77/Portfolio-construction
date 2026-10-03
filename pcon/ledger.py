@@ -12,8 +12,10 @@ Accounting conventions
   ``qty x multiplier x price`` from cash and the position is worth ``qty x multiplier x close``. NAV is
   therefore identical to margin accounting (cash + realised + unrealised P&L), and exposure is notional.
 * Dividends are credited on the ex-date to positions held at the previous close (``auto_dividends``).
-* Returns are time-weighted: external flows (deposits, withdrawals, transfers) are assumed to arrive at
-  the start of the day, ``r_t = NAV_t / (NAV_{t-1} + flow_t) - 1``.
+* Returns are time-weighted. External money coming in (deposits, transfers in) is assumed to arrive at the
+  start of the day and money going out (withdrawals, transfers out) to leave at the end of it:
+  ``r_t = (NAV_t + out_t) / (NAV_{t-1} + in_t) - 1``. A sleeve has no return before its first inflow, nor
+  after a withdrawal leaves (almost) nothing in it, until money comes back.
 """
 from __future__ import annotations
 
@@ -74,11 +76,31 @@ def _snap(calendar: pd.DatetimeIndex, dates) -> np.ndarray:
     return np.minimum(pos, len(calendar) - 1)
 
 
-def twr_returns(nav: pd.Series, flows: pd.Series) -> pd.Series:
-    """Daily time-weighted returns with start-of-day external flows."""
-    base = nav.shift(1).fillna(0.0) + flows
-    r = nav / base.where(base > MIN_CAPITAL) - 1
-    return r
+def twr_returns(nav: pd.Series, flows: pd.Series, outflows: pd.Series | None = None,
+                min_capital: float = MIN_CAPITAL) -> pd.Series:
+    """Daily time-weighted returns.
+
+    ``flows`` are the day's inflows (or signed net flows when ``outflows`` is None, then split by sign);
+    inflows are counted at the start of the day, outflows (negative) at the end. Returns are NaN until the
+    first inflow, and after an outflow leaves less than max(min_capital, 1% of the pre-withdrawal value).
+    """
+    if outflows is None:
+        fin, fout = flows.clip(lower=0.0), flows.clip(upper=0.0)
+    else:
+        fin, fout = flows, outflows
+    v, fi, fo = nav.to_numpy(float), fin.to_numpy(float), fout.to_numpy(float)
+    out = np.full(len(v), np.nan)
+    funded, prev = False, 0.0
+    for t in range(len(v)):
+        if fi[t] > 0:
+            funded = True
+        base = prev + fi[t]
+        if funded and base > min_capital:
+            out[t] = (v[t] - fo[t]) / base - 1
+        if fo[t] < 0 and v[t] <= max(min_capital, 0.01 * (v[t] - fo[t])):
+            funded = False                                  # withdrawn to (almost) nothing: sleeve closed
+        prev = v[t]
+    return pd.Series(out, index=nav.index)
 
 
 def build_ledger(cfg: PortfolioConfig, trades: pd.DataFrame, cashflows: pd.DataFrame, store: PriceStore,
@@ -182,6 +204,8 @@ def build_ledger(cfg: PortfolioConfig, trades: pd.DataFrame, cashflows: pd.DataF
     ext = cashflows[cashflows["external"]] if len(cashflows) else cashflows
     inc = cashflows[~cashflows["external"]] if len(cashflows) else cashflows
     F = per_sleeve(ext, "value")
+    F_in = per_sleeve(ext[ext["value"] > 0], "value") if len(ext) else F * 0
+    F_out = per_sleeve(ext[ext["value"] < 0], "value") if len(ext) else F * 0
     INC = per_sleeve(inc, "value")
     fees = per_sleeve(tr.assign(fee_v=tr["fees"]) if len(tr) else tr, "fee_v") if len(tr) else \
         pd.DataFrame(0.0, index=cal, columns=sleeves)
@@ -202,14 +226,27 @@ def build_ledger(cfg: PortfolioConfig, trades: pd.DataFrame, cashflows: pd.DataF
     shortv = by_sleeve(V.clip(upper=0))
     npos = by_sleeve((Q != 0).astype(float))
     pnl = nav.diff().fillna(nav) - F
-    rets = pd.DataFrame({s: twr_returns(nav[s], F[s]) for s in sleeves}, index=cal)
+    rets = pd.DataFrame({s: twr_returns(nav[s], F_in[s], F_out[s], max(MIN_CAPITAL, 1.0)) for s in sleeves},
+                        index=cal)
 
     tot_nav, tot_flow = nav.sum(axis=1), F.sum(axis=1)
+    # book level: transfers between sleeves cancel; split what is left (deposits, withdrawals) by sign
+    dep = per_sleeve(ext[ext["type"] != "transfer"], "value") if len(ext) else F * 0
+    net_tr = (F - dep).sum(axis=1)
+    book_in = dep.clip(lower=0).sum(axis=1) + net_tr.clip(lower=0)
+    book_out = dep.clip(upper=0).sum(axis=1) + net_tr.clip(upper=0)
     total = pd.DataFrame({"nav": tot_nav, "flows": tot_flow, "pnl": pnl.sum(axis=1),
-                          "ret": twr_returns(tot_nav, tot_flow), "long": longv.sum(axis=1),
+                          "ret": twr_returns(tot_nav, book_in, book_out, max(MIN_CAPITAL, 1.0)),
+                          "long": longv.sum(axis=1),
                           "short": shortv.sum(axis=1), "cash": cash.sum(axis=1)})
 
     for s in sleeves:
+        first_in = F_in[s].gt(0).idxmax() if F_in[s].gt(0).any() else None
+        early = (MV[s].abs() > 0) | (pnl[s].abs() > 0.005)
+        early = early.loc[:first_in - pd.Timedelta(days=1)] if first_in is not None else early
+        if early.any():
+            warn.append(f"{cfg.label(s)}: fills or P&L before the sleeve was funded; its returns start at the first "
+                        "deposit / transfer in. Record the funding on or before the first trade date.")
         if ((nav[s] <= MIN_CAPITAL) & (MV[s].abs() > 0)).any():
             warn.append(f"{cfg.label(s)}: NAV is zero or negative while holding positions. "
                         "Did you record the deposit / transfer that funds this sleeve?")

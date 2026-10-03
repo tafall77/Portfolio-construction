@@ -34,6 +34,7 @@ class StrategyConfig:
     backtest: Path | None = None            # CSV with date,return[,exposure]
     expectation_start: pd.Timestamp | None = None   # first date of the honest out-of-sample record
     active: bool = True                     # False = tracked but excluded from target allocation
+    risk_budget: float | None = None        # optional share of portfolio risk for the 'Your risk budgets' method
 
 
 @dataclass
@@ -54,6 +55,9 @@ class AllocationConfig:
     walk_forward_lookback_years: float = 3.0
     walk_forward_step: str = "Q"
     bootstrap_samples: int = 300
+    target_vol: float | None = None         # portfolio volatility target (e.g. 0.10); None = always fully invested
+    vol_halflife: int = 21                  # EWMA half-life (days) of the volatility estimate
+    vol_cap: float = 1.0                    # maximum exposure; 1.0 = never borrow
 
 
 @dataclass
@@ -108,6 +112,11 @@ class PortfolioConfig:
     def instrument(self, symbol: str) -> InstrumentConfig:
         return self.instruments.get(symbol) or InstrumentConfig(symbol=symbol)
 
+    def risk_budgets(self) -> pd.Series | None:
+        b = pd.Series({k: s.risk_budget for k, s in self.strategies.items() if s.active and s.risk_budget},
+                      dtype=float)
+        return b / b.sum() if len(b) and b.sum() > 0 else None
+
     def target_weights(self) -> pd.Series:
         w = pd.Series({k: s.target_weight for k, s in self.strategies.items() if s.active}, dtype=float)
         return w / w.sum() if w.sum() > 0 else w
@@ -151,7 +160,8 @@ def load_config(path: str | Path) -> PortfolioConfig:
             color=s.get("color", DEFAULT_COLORS[k % len(DEFAULT_COLORS)]),
             target_weight=float(s.get("target_weight", 0.0) or 0.0), description=s.get("description", ""),
             universe=s.get("universe", ""), backtest=(root / bt) if bt else None,
-            expectation_start=_ts(s.get("expectation_start")), active=bool(s.get("active", True)))
+            expectation_start=_ts(s.get("expectation_start")), active=bool(s.get("active", True)),
+            risk_budget=float(s["risk_budget"]) if s.get("risk_budget") is not None else None)
 
     instruments = {}
     for sym, spec in (raw.get("instruments") or {}).items():
@@ -165,7 +175,9 @@ def load_config(path: str | Path) -> PortfolioConfig:
         min_weight=float(a.get("min_weight", 0.0)), max_weight=float(a.get("max_weight", 1.0)),
         walk_forward_lookback_years=float(a.get("walk_forward_lookback_years", 3.0)),
         walk_forward_step=str(a.get("walk_forward_step", "Q")),
-        bootstrap_samples=int(a.get("bootstrap_samples", 300)))
+        bootstrap_samples=int(a.get("bootstrap_samples", 300)),
+        target_vol=float(a["target_vol"]) if a.get("target_vol") else None,
+        vol_halflife=int(a.get("vol_halflife", 21)), vol_cap=float(a.get("vol_cap", 1.0)))
     al = raw.get("alerts", {}) or {}
     alerts = AlertConfig(**{k: float(v) for k, v in al.items() if k in AlertConfig.__dataclass_fields__})
 
