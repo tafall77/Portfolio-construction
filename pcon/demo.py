@@ -7,6 +7,7 @@ folder says anything about the real strategies or markets.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -267,4 +268,52 @@ def build_demo(root: str | Path, force: bool = False) -> Path:
         pd.DataFrame({"date": r.index.strftime("%Y-%m-%d"), "return": r.round(8).to_numpy(),
                       "exposure": expo_s.reindex(r.index).round(4).to_numpy()}) \
             .to_csv(root / "backtests" / f"{sid}.csv", index=False)
+        (root / "backtests" / f"{sid}.meta.json").write_text(json.dumps(DEMO_META[sid], indent=2))
     return root
+
+
+# Synthetic selection records, in the format the export cells write (see strategy_exports/).
+DEMO_META = {
+    "sma_piotroski": {
+        "strategy": "sma_piotroski", "source": "DEMO (synthetic)", "data_end": END, "passed_selection": True,
+        "selected": "Walk-forward account; currently trading SMA50 | <=1/sector | 5 pos | equal",
+        "selection_rule": "Each out-of-sample year trades the configuration with the most scorecard points over the "
+                          "previous 3 years (180 configurations).",
+        "final_tests": {"Look-ahead audit: truncated-data rebuild identical": True,
+                        "PSR of the out-of-sample record > 0.95": True,
+                        "Out-of-sample Sharpe >= SPY buy & hold": False,
+                        "Deflated Sharpe of the best configuration > 0.95": True,
+                        "PBO < 0.5 (CSCV over the configuration grid)": True,
+                        "Walk-forward efficiency >= 0.5": True,
+                        "Bootstrap 5th-percentile Sharpe > 0": True},
+        "verdict": "DEMO: 6/7 final tests passed.", "oos_start": "2014-01-01"},
+    "regime_filter": {
+        "strategy": "regime_filter", "source": "DEMO (synthetic)", "data_end": END, "passed_selection": True,
+        "selected": "Optimized Tiers (>= 70%: 100% Nasdaq-100 | 40-60%: 100% S&P 500 | < 40%: Cash)",
+        "selection_rule": "Allocation rule with the highest Sharpe on the untouched test window (2005 -> today); "
+                          "optimised tiers were fitted on 1986-2004 only.",
+        "final_tests": {"Look-ahead audit: truncated-data rebuild matches": True,
+                        "Engine causality: future returns do not change the past": True,
+                        "Test window: Sharpe >= S&P 500 B&H": True,
+                        "Test window: max drawdown shallower than S&P 500 B&H": True,
+                        "Test window: Sharpe gain significant (bootstrap P(diff <= 0) < 0.05)": True,
+                        "Placebo timing test: p < 0.10": True,
+                        "Deflated Sharpe > 0.95 (design window, 540 trials)": True,
+                        "PBO < 0.5 (CSCV over the tier grid)": True},
+        "verdict": "DEMO: 8/8 final tests passed.", "oos_start": "2005-01-01"},
+    "rolling_momentum": {
+        "strategy": "rolling_momentum", "source": "DEMO (synthetic)", "data_end": END, "passed_selection": True,
+        "selected": "90D lookback, long/flat S&P 500",
+        "selection_rule": "Lookback that survived all four in-sample gates (2000-2020) with the highest in-sample "
+                          "Sharpe; frozen for all out-of-sample and cross-market tests.",
+        "final_tests": {"1. Selected lookback survived all in-sample gates": True,
+                        "2a. OOS Sharpe >= S&P 500 buy & hold": True,
+                        "2b. OOS Sharpe gain is significant (bootstrap p < 0.05)": True,
+                        "3. OOS max drawdown shallower than buy & hold": True,
+                        "4a. Low overfitting risk: PBO < 0.5 (candidate set)": True,
+                        "4b. Survives deflation: DSR > 0.95 (N = 4)": True,
+                        "5. Timing skill beyond exposure (circular-shift p < 0.05)": True,
+                        "6. Transfers to NQ: OOS Sharpe >= Nasdaq-100 buy & hold": True,
+                        "7. Beats B&H Sharpe at 2x cost and with a 1-day delay": True},
+        "verdict": "DEMO: SUPPORTED.", "oos_start": "2021-01-01"},
+}

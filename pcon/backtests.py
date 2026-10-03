@@ -10,6 +10,7 @@ is the invested share of capital. A file with an ``equity``/``nav`` column inste
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -60,3 +61,36 @@ def load_all(cfg) -> tuple[dict[str, pd.DataFrame], list[str]]:
         except Exception as exc:
             warn.append(f"{s.short}: could not read {s.backtest.name}: {exc}")
     return out, warn
+
+
+def meta_path(path: Path) -> Path:
+    """``backtests/x.csv`` -> ``backtests/x.meta.json`` (written by the export cells)."""
+    return path.with_name(path.stem + ".meta.json")
+
+
+def load_meta(path: Path) -> dict | None:
+    """Selection record saved next to an export: which configuration, the selection rule, the final tests
+    (name -> True / False / None for not applicable) and the notebook's verdict."""
+    m = meta_path(path)
+    if not m.exists():
+        return None
+    try:
+        meta = json.loads(m.read_text())
+    except (OSError, ValueError):
+        return None
+    meta.setdefault("final_tests", {})
+    return meta
+
+
+def load_all_meta(cfg) -> dict[str, dict]:
+    return {sid: m for sid, s in cfg.strategies.items()
+            if s.backtest is not None and (m := load_meta(s.backtest)) is not None}
+
+
+def tests_summary(meta: dict | None) -> tuple[int, int, list[str]]:
+    """(passed, evaluated, names of failed tests)."""
+    if not meta:
+        return 0, 0, []
+    t = meta.get("final_tests", {})
+    failed = [k for k, v in t.items() if v is False]
+    return sum(v is True for v in t.values()), sum(v is not None for v in t.values()), failed

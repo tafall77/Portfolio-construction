@@ -46,8 +46,13 @@ python -m pcon init                     # creates data/ from templates/workspace
    the first date of its honest out-of-sample record. The template already holds the right defaults for the
    three strategies.
 2. **Export each backtest.** Paste the matching cell from [`strategy_exports/`](strategy_exports/README.md) at
-   the end of each research notebook and run it. Each cell writes `data/backtests/<strategy>.csv`. The
-   *Portfolio construction* and *Expected vs actual* tabs work from this point on.
+   the end of each research notebook and run it.
+   * Each cell exports the configuration that passed that notebook's **final selection**: the walk-forward
+     account, the test-window winning rule, or the frozen lookback that survived the gates.
+   * It writes `data/backtests/<strategy>.csv` with the returns, plus a selection record with the final
+     tests and the verdict, which the dashboard displays.
+
+   The *Portfolio construction* and *Expected vs actual* tabs work from this point on.
 3. **Fund the sleeves.** Log a deposit per strategy in the *Transactions* tab, or deposit into `cash` (the
    unallocated sleeve) and move money to the strategies with transfers:
    ```bash

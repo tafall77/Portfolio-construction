@@ -10,7 +10,7 @@ import pandas as pd
 from . import allocation as A
 from . import expectations as E
 from . import metrics as M
-from .backtests import load_all
+from .backtests import load_all, load_all_meta
 from .config import CASH_SLEEVE, load_config
 from .journal import load_cashflows, load_marks, load_trades, unbalanced_transfers
 from .ledger import build_ledger
@@ -26,6 +26,7 @@ class Book:
         self.store = PriceStore(self.cfg, self.marks)
         self.ledger = build_ledger(self.cfg, self.trades, self.cashflows, self.store, end)
         self.backtests, self._bt_warnings = load_all(self.cfg)
+        self.backtest_meta = load_all_meta(self.cfg)
         self._cmp: dict = {}
 
     # ---- reference series --------------------------------------------------------------------
@@ -79,7 +80,14 @@ class Book:
         r = self.backtest_returns(sid)
         if r is None:
             return None
-        return E.expectation_window(r, self.cfg.strategies[sid].expectation_start, self.live_start(sid))
+        return E.expectation_window(r, self.expectation_start(sid), self.live_start(sid))
+
+    def expectation_start(self, sid: str):
+        """portfolio.yaml's ``expectation_start``, else the out-of-sample start recorded by the export cell."""
+        start = self.cfg.strategies[sid].expectation_start
+        if start is None and (self.backtest_meta.get(sid) or {}).get("oos_start"):
+            start = pd.Timestamp(self.backtest_meta[sid]["oos_start"])
+        return start
 
     def expected_portfolio(self) -> pd.Series | None:
         """Target-weighted mix of the strategies' expectation windows (common dates, configured rebalance)."""

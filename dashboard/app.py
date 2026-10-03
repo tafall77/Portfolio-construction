@@ -22,6 +22,7 @@ from pcon import allocation as A  # noqa: E402
 from pcon import charts as C  # noqa: E402
 from pcon import expectations as E  # noqa: E402
 from pcon import metrics as M  # noqa: E402
+from pcon.backtests import tests_summary  # noqa: E402
 from pcon.book import Book  # noqa: E402
 from pcon.config import CASH_SLEEVE  # noqa: E402
 from pcon.demo import build_demo  # noqa: E402
@@ -147,6 +148,39 @@ def diverging_bg(v, lim: float = 0.4) -> str:
     neg, _, pos = T["div"]
     a = min(abs(float(v)) / lim, 1.0) * 0.55
     return f"background-color: {C._rgba(pos if v >= 0 else neg, a)}"
+
+
+def selection_panel(sid: str):
+    """What was exported for this strategy and whether it passed the research notebook's final tests."""
+    meta = book.backtest_meta.get(sid)
+    if book.backtest_returns(sid) is None:
+        return
+    if meta is None:
+        st.info("This backtest export carries no selection record. Re-run the updated export cell in "
+                "`strategy_exports/` so the dashboard can confirm it is the configuration that passed the "
+                "notebook's final tests.", icon="ℹ️")
+        return
+    n_pass, n_eval, failed = tests_summary(meta)
+    icon = "✅" if not failed and meta.get("passed_selection", True) else "⚠️"
+    st.markdown(f"{icon} **Exported configuration:** {meta.get('selected', '–')}  \n"
+                f"**Selection rule:** {meta.get('selection_rule', '–')}  \n"
+                f"**Final tests:** {n_pass}/{n_eval} passed · source `{meta.get('source', '?')}` · data to "
+                f"{meta.get('data_end', '?')}")
+    with st.expander("Final tests and verdict from the research notebook", expanded=bool(failed)):
+        rows = [{"Test": k, "Result": {True: "✅ pass", False: "❌ fail", None: "– n/a"}[v]}
+                for k, v in meta.get("final_tests", {}).items()]
+        if rows:
+            st.dataframe(pd.DataFrame(rows).set_index("Test"))
+        if meta.get("verdict"):
+            st.markdown(f"**Verdict:** {meta['verdict']}")
+
+
+def tests_label(sid: str) -> str:
+    meta = book.backtest_meta.get(sid)
+    if meta is None:
+        return "–"
+    n_pass, n_eval, failed = tests_summary(meta)
+    return f"{'✅' if not failed else '⚠️'} {n_pass}/{n_eval}"
 
 
 def metric_table(df: pd.DataFrame, rows: list[str] | None = None):
@@ -308,14 +342,16 @@ def page_overview():
             "Open positions": int((op["strategy"] == s).sum()) if len(op) else 0,
             "Pctile vs expected": cmp_.table.loc["Return", "Percentile"] if cmp_ else np.nan,
             "Status": STATUS_ICON.get(cmp_.table.loc["Return", "Status"], "–") if cmp_ else "–",
-            "vs model": tr["Implementation shortfall"] if tr else np.nan})
+            "vs model": tr["Implementation shortfall"] if tr else np.nan,
+            "Final tests": tests_label(s) if s in cfg.strategies else "–"})
     df = pd.DataFrame(rows).set_index("Strategy")
     st.dataframe(df.style.format({"NAV": lambda v: money(v, cur), "Weight": "{:.1%}", "Target": "{:.0%}",
                                   "Return (live)": "{:.2%}", "Volatility": "{:.1%}", "Sharpe": "{:.2f}",
                                   "Max DD": "{:.1%}", "Pctile vs expected": "{:.0%}",
                                   "vs model": "{:+.2%}"}, na_rep="–"))
     st.caption("*Pctile vs expected*: where the live return sits among same-length backtest paths (50% = as "
-               "expected). *vs model*: live minus the backtest on the same days (execution shortfall).")
+               "expected). *vs model*: live minus the backtest on the same days (execution shortfall). *Final "
+               "tests*: how many of the research notebook's final tests the exported configuration passed.")
 
 
 # ------------------------------------------------------------------------------------------------
@@ -338,6 +374,7 @@ def page_strategies():
     sid = st.radio("Strategy", SIDS, format_func=lambda s: cfg.strategies[s].name, horizontal=True)
     s_cfg = cfg.strategies[sid]
     st.caption(" · ".join(x for x in [s_cfg.description, s_cfg.universe] if x))
+    selection_panel(sid)
     live = book.live_returns().get(sid)
     model = book.model_on_live_dates(sid)
     if live is not None and len(live) > 1:
@@ -391,7 +428,7 @@ def page_strategies():
         if bt is None:
             st.info("No backtest export for this strategy. See `strategy_exports/README.md`.")
         else:
-            exp_start = s_cfg.expectation_start
+            exp_start = book.expectation_start(sid)
             st.caption(f"Export covers {bt.index[0]:%Y-%m-%d} → {bt.index[-1]:%Y-%m-%d}. Expectation window starts "
                        f"{(exp_start or bt.index[0]):%Y-%m-%d} (set `expectation_start` to the honest "
                        "out-of-sample start).")
@@ -1001,11 +1038,14 @@ def page_journal():
         for s in SIDS:
             bt = book.backtest_returns(s)
             sc = cfg.strategies[s]
+            meta = book.backtest_meta.get(s) or {}
             rows.append({"Strategy": LABELS[s], "Backtest file": sc.backtest.name if sc.backtest else "–",
                          "Loaded": "yes" if bt is not None else "no",
+                         "Exported configuration": meta.get("selected", "no selection record"),
+                         "Final tests": tests_label(s),
                          "From": bt.index[0] if bt is not None else pd.NaT,
                          "To": bt.index[-1] if bt is not None else pd.NaT,
-                         "Expectation from": sc.expectation_start,
+                         "Expectation from": book.expectation_start(s),
                          "Covers live period": "yes" if book.model_on_live_dates(s) is not None else "no"})
         st.dataframe(pd.DataFrame(rows).set_index("Strategy").style.format(
             {"From": lambda v: "–" if pd.isna(v) else f"{v:%Y-%m-%d}",

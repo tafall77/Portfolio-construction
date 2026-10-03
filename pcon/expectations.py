@@ -200,7 +200,23 @@ def health_checks(book) -> list[dict]:
     out: list[dict] = []
     cfg, L = book.cfg, book.ledger
     a = cfg.alerts
+    from .backtests import tests_summary
     for sid, s in cfg.strategies.items():
+        meta = book.backtest_meta.get(sid)
+        if book.backtest_returns(sid) is not None and meta is None:
+            out.append(dict(level="info", scope=s.short,
+                            msg="The backtest export has no selection record: re-run the updated export cell so the "
+                                "dashboard can confirm it is the configuration that passed the notebook's final tests."))
+        elif meta is not None:
+            n_pass, n_eval, failed = tests_summary(meta)
+            if not meta.get("passed_selection", True):
+                out.append(dict(level="amber", scope=s.short,
+                                msg=f"Exported configuration ({meta.get('selected', '?')}) is NOT the notebook's final "
+                                    "selection (override, or no candidate survived the selection gates)."))
+            if failed:
+                out.append(dict(level="amber", scope=s.short,
+                                msg=f"{meta.get('selected', 'Exported configuration')} passed {n_pass}/{n_eval} final "
+                                    f"tests; failed: {'; '.join(failed[:3])}{' ...' if len(failed) > 3 else ''}."))
         cmp_ = book.comparison(sid)
         live = book.live_returns().get(sid)
         if live is None or len(live.dropna()) < 2:
