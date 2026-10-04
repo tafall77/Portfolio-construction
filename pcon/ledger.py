@@ -118,8 +118,8 @@ def build_ledger(cfg: PortfolioConfig, trades: pd.DataFrame, cashflows: pd.DataF
     if last_event.normalize() > end:
         warn.append(f"Journal has entries dated after {end:%Y-%m-%d}; they are booked on the last day shown.")
     cal = store.calendar(first, end)
-    if len(cal) == 0:
-        return empty_ledger(["No trading days in range."])
+    if len(cal) == 0:            # e.g. a first deposit dated on a weekend or holiday: start the book that day
+        cal = pd.DatetimeIndex([pd.Timestamp(first).normalize()])
     if cal[0] > pd.Timestamp(first).normalize():
         cal = pd.DatetimeIndex([pd.Timestamp(first).normalize()]).append(cal)
     n = len(cal)
