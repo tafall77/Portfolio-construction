@@ -1,0 +1,12 @@
+# Your book: trades, cash flows and backtest exports stay on your machine.
+# This repository is PUBLIC. If you make it private and want the journal versioned, delete the next line.
+data/
+
+# generated
+examples/demo/
+cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
