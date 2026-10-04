@@ -55,3 +55,24 @@ print(f"{MARKET}, lookback {SELECTED} ({'survived the gates' if SELECTED_SURVIVE
       f"{(EXPORT_DIR / 'rolling_momentum.csv').resolve()}")
 print(f"Final scorecard: {n_pass}/{n_eval} checks passed. Verdict: {meta['verdict'][:160]}")
 print("Position for the next session:", "LONG" if frame["signal"].iloc[-1] == 1 else "CASH")
+
+# ---- what to hold -> signals/rolling_momentum.json (read by the dashboard's Orders tab) ----------------
+# The backtest decides at each close and holds from that close; trade as near the close as you can on the
+# day the signal flips (the dashboard's Expected vs actual measures what a later fill costs).
+TRADE_AS = "SPY" if MARKET == "S&P 500" else "QQQ"     # the symbol you trade (as logged in your journal)
+SIGNALS_DIR = Path(os.environ.get("PCON_SIGNALS", EXPORT_DIR.parent / "signals"))
+mkt = spx if MARKET == "S&P 500" else ndx
+m_now = float(rm.momentum(mkt.close, SELECTED).iloc[-1])
+long_now = bool(frame["signal"].iloc[-1] == 1)
+signal = {
+    "strategy": "rolling_momentum", "kind": "weights", "selected": meta["selected"], "order": "At the close",
+    "as_of": f"{frame.index[-1]:%Y-%m-%d}", "generated": f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}",
+    "source": meta["source"], "weights": {TRADE_AS: 1.0} if long_now else {},
+    "momentum": m_now,
+    "execution": f"Daily: long {TRADE_AS} while the {MARKET}'s trailing {SELECTED} return is positive, cash "
+                 f"(T-bills) otherwise. At this close it is {m_now:+.2%}.",
+}
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+(SIGNALS_DIR / "rolling_momentum.json").write_text(json.dumps(signal, indent=2))
+print(f"Signal: {'LONG ' + TRADE_AS if long_now else 'CASH'} ({SELECTED} momentum {m_now:+.2%}) -> "
+      f"{(SIGNALS_DIR / 'rolling_momentum.json').resolve()}")

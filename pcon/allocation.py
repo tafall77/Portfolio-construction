@@ -764,3 +764,38 @@ def rebalance_orders(nav: pd.Series, target: pd.Series, labels: dict | None = No
     if labels:
         df.index = [labels.get(i, i) for i in df.index]
     return df
+
+
+# ---- method comparison and the recommendation ----------------------------------------------------
+def compare_methods(R: pd.DataFrame, rf: pd.Series | None = None, lo: float = 0.0, hi: float = 1.0,
+                    target: pd.Series | None = None, budgets: pd.Series | None = None, rebalance: str = "M",
+                    wf_days: int = 756, step: str = "Q", n_resamples: int = 200
+                    ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.Series]]:
+    """Weights of every method, in-sample and walk-forward statistics, and the walk-forward return series."""
+    W, rows, wf = {}, {}, {}
+    for m in METHODS:
+        if m == "risk_budget" and budgets is None:
+            continue
+        w = optimize(R, m, rf, lo, hi, target, n_resamples, budgets=budgets)
+        W[m] = w
+        r = portfolio_returns(R, w, rebalance)
+        s = stats_row(r, rf)
+        if m in ("equal", "target"):
+            r_wf, turnover = r.iloc[wf_days:], 0.0
+        else:
+            r_wf, Wh = walk_forward(R, m, rf, wf_days, step, rebalance, lo, hi, target, 30, budgets)
+            turnover = weight_turnover(Wh)
+        s_wf = stats_row(r_wf, rf)
+        rows[m] = {**s, **{f"WF {k}": v for k, v in s_wf.items() if k in ("CAGR", "Sharpe", "Max drawdown",
+                                                                             "Calmar")},
+                   "Weight turnover / quarter": turnover}
+        wf[m] = r_wf
+    return pd.DataFrame(W).T, pd.DataFrame(rows).T, wf
+
+
+def recommend(stats: pd.DataFrame, tolerance: float = 0.05) -> str:
+    """The method with the best walk-forward Sharpe, preferring the resampled allocation when it is within
+    ``tolerance`` of it (more stable weights for an insignificant difference)."""
+    sr = stats["WF Sharpe"].astype(float)
+    best = sr.idxmax()
+    return "resampled" if "resampled" in sr and sr["resampled"] >= sr[best] - tolerance else best

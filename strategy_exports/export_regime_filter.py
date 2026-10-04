@@ -78,3 +78,31 @@ print(f"{RULE}{' (test-window winner)' if RULE == winner else ' (OVERRIDE; winne
 print(meta["verdict"])
 last = res["w"].iloc[-1]
 print(f"Current weights: S&P {last['SPX']:.0%}, Nasdaq-100 {last['NDX']:.0%}, cash {last['CASH']:.0%}")
+
+# ---- what to hold -> signals/regime_filter.json (read by the dashboard's Orders tab) ----------------------
+# The backtest fills each month's decision at the close on the first trading day of the NEXT month
+# (EXEC_LAG_DAYS after the month-end signal). So: hold the last filled decision now, and switch to the live
+# reading (section "Live", decision month `now`) on the next monthly trade date.
+TRADE_AS = {"SPX": "SPY", "NDX": "QQQ"}       # the symbols you trade for each sleeve (as logged in your journal)
+SIGNALS_DIR = Path(os.environ.get("PCON_SIGNALS", EXPORT_DIR.parent / "signals"))
+as_weights = lambda w: {TRADE_AS[k]: round(float(w[k]), 6) for k in TRADE_AS if float(w[k]) > 1e-9}
+hold_now = res["target"].iloc[-1]
+signal = {
+    "strategy": "regime_filter", "kind": "weights", "selected": meta["selected"], "order": "At the close",
+    "as_of": f"{(live_px if 'live_px' in globals() else rets['SPX']).dropna().index[-1]:%Y-%m-%d}",
+    "generated": f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}", "source": meta["source"],
+    "weights": as_weights(hold_now), "decision_month": str(res["target"].index[-1]),
+    "execution": "Monthly. Trade at the close on the first trading day of the month; hold (weights drift) "
+                 "until the next one. Cash = T-bills.",
+}
+if "live_alloc" in globals() and RULE in live_alloc:
+    nxt = pd.bdate_range((pd.Period(str(now), "M") + 1).start_time, periods=1)[0]
+    signal.update(next_weights=as_weights(live_alloc[RULE]), next_trade=f"{nxt:%Y-%m-%d}",
+                  next_decision_month=str(now))
+else:
+    print("NOTE: run the notebook's live section first to include next month's allocation.")
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+(SIGNALS_DIR / "regime_filter.json").write_text(json.dumps(signal, indent=2))
+print(f"Signal: hold {signal['weights'] or 'cash'}"
+      + (f"; from {signal['next_trade']}: {signal['next_weights'] or 'cash'}" if "next_trade" in signal else "")
+      + f"  -> {(SIGNALS_DIR / 'regime_filter.json').resolve()}")

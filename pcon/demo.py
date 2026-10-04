@@ -256,6 +256,49 @@ def build_demo(root: str | Path, force: bool = False) -> Path:
     (root / "portfolio.yaml").write_text("# DEMO workspace: synthetic data, see pcon/demo.py\n"
                                          + yaml.safe_dump(DEMO_CONFIG, sort_keys=False))
 
+    # ---- signals: what each toy rule wants after the last close (format of strategy_exports/) ---
+    d = live[-1]
+    sig_dir = root / "signals"
+    sig_dir.mkdir(exist_ok=True)
+    m_on = spy_px.loc[d] / spy_px.loc[:d - pd.Timedelta(days=90)].iloc[-1] - 1 > 0
+    c = conf.loc[d]
+    month_w = {"QQQ": 0.99} if c >= 0.7 else ({"SPY": 0.99} if c >= 0.4 else {"BIL": 0.99})
+    sim = sims["sma_piotroski"]
+    hold = []
+    for sym in sim.pos:
+        tp = float(s200[sym].loc[d])
+        exit_ = ("take profit (SMA200)" if stock_px[sym].loc[d] >= tp else
+                 "time limit" if (d - held_since[sym]).days > 365 else None)
+        hold.append(dict(symbol=sym, sector=STOCKS[sym][0], entry_date=f"{held_since[sym]:%Y-%m-%d}",
+                         last_close=float(stock_px[sym].loc[d]), take_profit=tp, stop=None, exit=exit_))
+    kept = [h for h in hold if not h["exit"]]
+    sectors = {h["sector"] for h in kept}
+    cands = [s_ for s_ in sorted(STOCKS, key=lambda s_: STOCKS[s_][3]) if s_ not in sim.pos
+             and sma50[s_].loc[d] < stock_px[s_].loc[d] < s200[s_].loc[d]]
+    picks = []
+    for s_ in cands:
+        if STOCKS[s_][0] not in sectors:
+            picks.append(dict(symbol=s_, sector=STOCKS[s_][0], weight=0.2, last_close=float(stock_px[s_].loc[d]),
+                              take_profit=float(s200[s_].loc[d])))
+            sectors.add(STOCKS[s_][0])
+    mkt_ok = bool(spy_px.loc[d] > sma200.loc[d])
+    slots = max(0, 5 - len(kept)) if mkt_ok else 0
+    signals = {
+        "rolling_momentum": dict(kind="weights", weights={"SPY": 0.99} if m_on else {"BIL": 0.99},
+                                 selected="90D lookback, long/flat S&P 500 (demo)", order="At the close",
+                                 execution="Daily: long the S&P 500 while its 90-day return is positive, else T-bills."),
+        "regime_filter": dict(kind="weights", weights=month_w, selected="Optimized Tiers (demo)", order="At the close",
+                              execution="Monthly: trade at the close on the first trading day of the month."),
+        "sma_piotroski": dict(kind="stock_picks", selected="Walk-forward account (demo)", max_positions=5,
+                              position_weight=0.2, market_ok=mkt_ok, holdings=hold, buys=picks[:slots],
+                              backups=picks[slots:slots + 3] if slots else [],
+                              execution="Exits and entries at the next open; take-profit limits at each "
+                                        "stock's SMA200."),
+    }
+    for sid, sig in signals.items():
+        sig.update(strategy=sid, as_of=f"{d:%Y-%m-%d}", generated=f"{d:%Y-%m-%d}T22:00:00", source="pcon/demo.py")
+        (sig_dir / f"{sid}.json").write_text(json.dumps(sig, indent=2))
+
     # ---- backtests: history + "model" on live dates (live sleeve returns + execution noise) ----
     from .book import Book
     book = Book(root)

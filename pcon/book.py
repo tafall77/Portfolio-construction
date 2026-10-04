@@ -10,6 +10,7 @@ import pandas as pd
 from . import allocation as A
 from . import expectations as E
 from . import metrics as M
+from . import orders as O
 from .backtests import load_all, load_all_meta
 from .config import CASH_SLEEVE, load_config
 from .journal import load_cashflows, load_marks, load_trades, unbalanced_transfers
@@ -27,6 +28,7 @@ class Book:
         self.ledger = build_ledger(self.cfg, self.trades, self.cashflows, self.store, end)
         self.backtests, self._bt_warnings = load_all(self.cfg)
         self.backtest_meta = load_all_meta(self.cfg)
+        self.signals, self._sig_warnings = O.load_signals(self.cfg)
         self._cmp: dict = {}
 
     # ---- reference series --------------------------------------------------------------------
@@ -126,7 +128,7 @@ class Book:
         return E.health_checks(self)
 
     def data_warnings(self) -> list[str]:
-        out = list(dict.fromkeys(self._bt_warnings + self.ledger.warnings + self.store.warnings))
+        out = list(dict.fromkeys(self._bt_warnings + self._sig_warnings + self.ledger.warnings + self.store.warnings))
         for d, v in unbalanced_transfers(self.cashflows).items():
             out.append(f"Transfers on {d:%Y-%m-%d} net to {v:+,.2f} instead of 0: each transfer needs a matching "
                        "row in the other sleeve (use 'Move money between strategies' in Transactions).")
@@ -136,6 +138,40 @@ class Book:
                 out.append(f"{self.label(sid)}: backtest ends {bt.index[-1]:%Y-%m-%d}, before live trading began; "
                            "re-export it to enable live-vs-model tracking.")
         return out
+
+    # ---- orders ------------------------------------------------------------------------------
+    def sleeve_positions(self, sid: str) -> dict[str, float]:
+        """Open quantity per symbol in one strategy's sleeve (today's share units)."""
+        op = self.ledger.open_positions
+        if self.ledger.empty or op is None or op.empty:
+            return {}
+        g = op[op["strategy"] == sid]
+        return {r.symbol: float(r.quantity) for r in g.itertuples()}
+
+    def last_prices(self, symbols) -> dict[str, float]:
+        """Latest close per symbol (journal marks / local files / Yahoo); NaN when unavailable."""
+        out = {}
+        start = pd.Timestamp.today().normalize() - pd.Timedelta(days=15)
+        for s in dict.fromkeys(symbols):
+            if not self.ledger.empty and s in self.ledger.prices.columns and self.ledger.prices[s].notna().any():
+                out[s] = float(self.ledger.prices[s].dropna().iloc[-1])
+                continue
+            h = self.store.history(s, start)
+            out[s] = float(h["close"].dropna().iloc[-1]) if h is not None and h["close"].notna().any() else float("nan")
+        return out
+
+    def order_plans(self, weights: pd.Series, account: float, invest: float = 1.0,
+                    band: float = O.WEIGHT_BAND) -> list[O.Plan]:
+        """Per-strategy orders: each strategy gets ``account x invest x weight`` and its latest signal."""
+        plans = []
+        for sid, sig in self.signals.items():
+            w = float(weights.get(sid, 0.0) or 0.0)
+            syms = list(sig.get("weights", {})) + list(sig.get("next_weights") or {}) + \
+                [h["symbol"] for h in sig.get("holdings", [])] + \
+                [b["symbol"] for b in sig.get("buys", [])] + list(self.sleeve_positions(sid))
+            plans.append(O.plan(sid, sig, account * invest * w, self.sleeve_positions(sid), self.last_prices(syms),
+                                self.cfg, band))
+        return plans
 
     # ---- allocation --------------------------------------------------------------------------
     def strategy_returns(self, source: str = "backtest", strategies: list[str] | None = None) -> dict[str, pd.Series]:
