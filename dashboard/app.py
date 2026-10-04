@@ -160,7 +160,7 @@ def table(df: pd.DataFrame, fmt, style=None, **kwargs):
     sent as text ('–' in the gaps, numbers still formatted by ``fmt`` and right-aligned). ``style`` gets the Styler
     and the original numeric frame, for colouring rules.
     """
-    gaps = [c for c in df.columns if df[c].dtype.kind == "f" and df[c].isna().any()]
+    gaps = [c for c in df.columns if df[c].dtype.kind in "fO" and df[c].isna().any()]
     shown = df.astype({c: object for c in gaps})
     for c in gaps:
         shown[c] = shown[c].where(df[c].notna(), "–")

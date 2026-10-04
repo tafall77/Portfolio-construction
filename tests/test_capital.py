@@ -55,3 +55,12 @@ def test_save_validates_and_keeps_backup(workspace):
     tr.loc[0, "price"] = 101.0                                         # fix a typo in the first fill
     save_trades(cfg, tr)
     assert pd.read_csv(cfg.trades_path).loc[0, "price"] == 101.0
+
+
+def test_first_deposit_on_a_weekend_after_the_last_trading_day(workspace):
+    # SPY data ends Fri 2026-01-16; a fresh book whose only entry is a deposit dated Sunday 2026-01-18
+    (workspace / "trades.csv").write_text("date,strategy,symbol,side,quantity,price,fees,note\n")
+    (workspace / "cashflows.csv").write_text("date,strategy,type,amount,note\n2026-01-18,a,deposit,200,\n")
+    b = Book(workspace, end="2026-01-18")
+    assert not b.ledger.empty
+    assert b.capital_summary().loc["Total", "NAV"] == pytest.approx(200)
