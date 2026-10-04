@@ -23,6 +23,7 @@ from pcon import charts as C  # noqa: E402
 from pcon import expectations as E  # noqa: E402
 from pcon import metrics as M  # noqa: E402
 from pcon import orders as O  # noqa: E402
+from pcon import runner as RUN  # noqa: E402
 from pcon.backtests import tests_summary  # noqa: E402
 from pcon.book import Book  # noqa: E402
 from pcon.config import CASH_SLEEVE  # noqa: E402
@@ -392,10 +393,125 @@ ORDER_HELP = {
 }
 
 
+def _progress(sid: str) -> str:
+    tail = RUN.log_tail(ws, sid, 60).splitlines()
+    cell = next((l for l in reversed(tail) if l.startswith("@@ cell")), "")
+    return cell.replace("@@ ", "") if cell else "starting"
+
+
+@st.fragment(run_every=4)
+def update_progress():
+    stt = RUN.read_status(ws)
+    if stt.get("running"):
+        sid = stt["running"]
+        name = LABELS.get(sid, sid)
+        st.info(f"⏳ Updating **{name}** ({_progress(sid) if sid in RUN.SPECS else 'starting'}). Typical time: "
+                f"{RUN.SPECS[sid].minutes if sid in RUN.SPECS else 'a few minutes'}. You can keep using the dashboard; "
+                "this refreshes by itself.")
+    elif st.session_state.get("update_seen_running"):
+        st.session_state.update_seen_running = False
+        st.rerun(scope="app")                                  # finished: reload the book with the new signals
+    if stt.get("running"):
+        st.session_state.update_seen_running = True
+
+
+def signals_panel():
+    """Run the strategies on fresh data (the notebooks in strategies/, unchanged) and show what each produced."""
+    stt = RUN.read_status(ws)
+    res = stt.get("results", {})
+    settings = RUN.load_settings(ws)
+    need_sec = "sma_piotroski" in SIDS and not RUN.valid_sec_contact(settings.get("sec_contact", ""))
+    rows = []
+    for s_ in SIDS:
+        sig, r = book.signals.get(s_), res.get(s_, {})
+        rows.append({"Strategy": LABELS[s_],
+                     "Signal from close of": f"{sig['as_of']:%a %d %b}" if sig else "–",
+                     "Up to date": ("no" if O.is_stale(sig) else "yes") if sig else "no signal",
+                     "Last update": (("✅ " if r.get("ok") else "❌ ") + r.get("finished", "")[5:16]) if r else "never",
+                     "Result": r.get("message", "").split(" -> ")[0][:90]})
+    a, b = st.columns([3, 1])
+    with a:
+        st.dataframe(pd.DataFrame(rows).set_index("Strategy"), width="stretch")
+    with b:
+        running = bool(stt.get("running"))
+        stale = any(r["Up to date"] != "yes" for r in rows)
+        if st.button("Update signals now", type="primary" if stale else "secondary", width="stretch",
+                     disabled=running or cfg.demo,
+                     help="Runs the three strategies on fresh market data (Yahoo, FRED, SEC). Do it after the US "
+                          "close, before placing orders."):
+            RUN.start_update(ws)
+            st.session_state.update_seen_running = True
+            st.rerun()
+        if cfg.demo:
+            st.caption("Demo book: its signals are synthetic. Switch to *data (my book)* to run the strategies.")
+        if stt.get("crashed"):
+            st.caption("The last update stopped before finishing (window closed?). Run it again.")
+    update_progress()
+    for s_, r in res.items():
+        if not r.get("ok") and s_ in SIDS:
+            with st.expander(f"❌ {LABELS[s_]}: what went wrong"):
+                st.code(RUN.log_tail(ws, s_, 25) or r.get("message", ""), language=None)
+    with st.expander("Data sources" + (" · ⚠️ needs your SEC contact" if need_sec else ""), expanded=need_sec and not cfg.demo):
+        st.markdown("The SMA / Piotroski strategy reads company filings from the SEC, which asks every user for a "
+                    "contact in the request header. It is saved in your workspace (`settings.json`, never uploaded).")
+        with st.form("sources"):
+            contact = st.text_input("Your name and e-mail", value=settings.get("sec_contact", ""),
+                                    placeholder="Jane Doe jane@example.org")
+            fred = st.text_input("FRED API key (optional)", value=settings.get("fred_api_key", ""), type="password",
+                                 help="Without one, the regime filter uses FRED's public CSV download.")
+            if st.form_submit_button("Save"):
+                if contact and not RUN.valid_sec_contact(contact):
+                    st.error("Enter a name followed by an e-mail address, e.g. `Jane Doe jane@example.org`.")
+                else:
+                    RUN.save_settings(ws, sec_contact=contact.strip(), fred_api_key=fred.strip())
+                    st.success("Saved.")
+
+
+def fills_logger(plans: list):
+    """Tick the orders you executed, adjust quantity / price, and write them to the journal in one click."""
+    o = pd.concat([p_.orders for p_ in plans if len(p_.orders)], ignore_index=True) if plans else pd.DataFrame()
+    if o.empty:
+        return
+    st.subheader("4 · Log what you executed")
+    st.caption("Tick each order you filled and enter the actual fill price (and quantity, if different). Limit and "
+               "stop orders: tick only if they filled. Netted orders are logged per strategy at the same price.")
+    ed = pd.DataFrame({"Filled": False, "Strategy": o["strategy"].map(LABELS), "Symbol": o["symbol"], "Side": o["side"],
+                       "Quantity": o["quantity"].astype(float),
+                       "Fill price": o["limit"].fillna(o["price"]).round(2), "Fees": 0.0})
+    edited = st.data_editor(ed, hide_index=True, width="stretch", key=f"fills_{len(book.trades)}",
+                            disabled=["Strategy", "Symbol", "Side"],
+                            column_config={"Quantity": st.column_config.NumberColumn(min_value=0.0, format="%.4g"),
+                                           "Fill price": st.column_config.NumberColumn(min_value=0.0, format="%.4f"),
+                                           "Fees": st.column_config.NumberColumn(min_value=0.0, format="%.2f")})
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        day = st.date_input("Fill date", value=date.today(), key="fill_date")
+    with c2:
+        st.write("")
+        if st.button("Add ticked fills to the journal", type="primary", disabled=not edited["Filled"].any()):
+            done, errors = 0, []
+            for _, r_ in edited[edited["Filled"]].iterrows():
+                try:
+                    sid = next(k for k, v in LABELS.items() if v == r_["Strategy"])
+                    append_trade(cfg, day, sid, r_["Symbol"], r_["Side"], r_["Quantity"], r_["Fill price"],
+                                 r_["Fees"], note="logged from Orders")
+                    done += 1
+                except JournalError as exc:
+                    errors.append(f"{r_.Symbol}: {exc}")
+            if errors:
+                st.error("Not logged: " + "; ".join(errors))
+            if done:
+                st.success(f"Logged {done} fill(s).")
+                st.rerun()
+
+
+
 def page_orders():
-    st.markdown("What to trade next. Each strategy's **latest signal** (exported by its research notebook) is sized to "
-                "the capital the **allocation** gives it, then compared with what its sleeve holds today. Orders of the "
+    st.markdown("What to trade next. Each strategy runs on fresh market data, its **latest signal** is sized to the "
+                "capital the **allocation** gives it, and compared with what its sleeve holds today. Orders of the "
                 "same timing are netted across strategies.")
+    st.subheader("Signals")
+    signals_panel()
     ctx = allocation_context()
     options = ([f"Best Sharpe ({A.METHODS[ctx['rec']]})"] if ctx else []) + ["Your target weights (portfolio.yaml)"]
     c1, c2 = st.columns([1.4, 1])
@@ -433,10 +549,23 @@ def page_orders():
     table(capdf[["Weight", "Capital", "Sleeve now", "Transfer", "Signal as of"]],
           {"Weight": "{:.0%}", "Capital": lambda v: money(v, cur), "Sleeve now": lambda v: money(v, cur),
            "Transfer": lambda v: money(v, cur)})
-    if (capdf["Transfer"].abs() > max(1.0, 0.01 * account)).any():
-        st.caption("Sleeves are bookkeeping inside one brokerage account: record the *Transfer* column with **Move "
-                   "money between strategies** (or deposits) in the Transactions tab, so each strategy's record "
-                   "starts from the capital it trades with.")
+    moves = capdf["Transfer"][capdf["Transfer"].abs() > max(1.0, 0.01 * account)]
+    if len(moves):
+        a, b = st.columns([3, 1])
+        with a:
+            st.caption("Strategies are bookkeeping sleeves inside one brokerage account. Moving capital between them "
+                       "is not a trade: it is recorded as transfers (through *Unallocated* cash), so each strategy's "
+                       "record starts from the capital it trades with.")
+        with b:
+            if st.button("Record these transfers", width="stretch", disabled=cfg.demo or abs(account - nav_now) > 1.0,
+                         help="Writes the Transfer column to the journal, dated today. Only when the account value "
+                              "equals the book's NAV (otherwise record the deposit first)."):
+                for s_, amt in moves.items():
+                    sid = next(k for k, v in LABELS.items() if v == s_)
+                    src, dst = (CASH_SLEEVE, sid) if amt > 0 else (sid, CASH_SLEEVE)
+                    append_transfer(cfg, date.today(), src, dst, round(abs(amt), 2), note="allocation (Orders tab)")
+                st.success("Transfers recorded.")
+                st.rerun()
 
     plans = book.order_plans(weights, account, invest)
     missing = [s_ for s_ in SIDS if s_ not in book.signals]
@@ -445,15 +574,14 @@ def page_orders():
     st.subheader("2 · Orders to place")
     net = O.net_orders(plans)
     if not plans:
-        st.info("No signals yet. Re-run each research notebook with its export cell from `strategy_exports/`: the cell "
-                "writes `signals/<strategy>.json` next to `backtests/`.")
+        st.info("No signals yet: click **Update signals now** above.")
     elif net.empty:
         st.success("No orders: every strategy already holds what its signal says.")
     else:
         stale = [LABELS[s_] for s_, g in book.signals.items() if O.is_stale(g)]
         if stale:
-            st.warning(f"Signals for {', '.join(stale)} are out of date: re-run those notebooks (with fresh data) "
-                       "and their export cells before trading.", icon="⚠️")
+            st.warning(f"Signals for {', '.join(stale)} are out of date: click **Update signals now** before "
+                       "trading.", icon="⚠️")
         shown = net.rename(columns={"symbol": "Symbol", "side": "Side", "quantity": "Quantity", "order": "Order",
                                     "limit": "Limit / stop", "price": "Last price", "value": "≈ Value",
                                     "strategies": "Strategies"})
@@ -497,8 +625,8 @@ def page_orders():
             for n_ in p_.notes:
                 st.markdown(f"- {n_}")
     for s_ in missing:
-        st.info(f"**{LABELS[s_]}**: no signal file (`signals/{s_}.json`). Re-run its notebook with the updated export "
-                "cell from `strategy_exports/`.")
+        st.info(f"**{LABELS[s_]}**: no signal yet. Click **Update signals now** above.")
+    fills_logger(plans)
 
 
 
