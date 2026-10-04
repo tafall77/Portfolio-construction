@@ -66,3 +66,77 @@ print(f"Saved {len(out):,} days ({out.index[0]:%Y-%m-%d} -> {out.index[-1]:%Y-%m
       f"{(EXPORT_DIR / 'sma_piotroski.csv').resolve()}")
 print(meta["selected"])
 print(meta["verdict"])
+
+# ---- the account's next-open plan -> signals/sma_piotroski.json (read by the dashboard's Orders tab) ------
+# Re-applies run_backtest's own rules at the last close: which holdings exit at the next open, which candidates
+# fill the free slots (ranking, sector cap, market filter, sizing), and each holding's take-profit limit.
+# Run with REFRESH_DATA = True so the last close is the latest one. Tickers are Yahoo symbols (BRK-B = BRK.B).
+from collections import Counter
+
+SIGNALS_DIR = Path(os.environ.get("PCON_SIGNALS", EXPORT_DIR.parent / "signals"))
+acct = fresh if LIVE_START else WF               # the model account your sleeve follows
+dts, i = FEAT["dates"], len(FEAT["dates"]) - 1
+prm = schedule[0][1]
+for d0, p0 in schedule:                          # parameters in force at the last close
+    if d0 is None or pd.Timestamp(d0) <= dts[i]:
+        prm = p0
+maxp, cap, fmin = prm["max_positions"], prm["max_per_sector"], prm["f_min"]
+tick, sec, sec_names = list(FEAT["tickers"]), FEAT["sector_code"], FEAT["sector_names"]
+mkt_ok = bool(FEAT["market_ok"][i])
+num_ = lambda x: float(x) if x is not None and np.isfinite(x) else None
+
+holdings = []
+for r in acct["open"].itertuples():
+    j = tick.index(r.ticker)
+    bars_held_at_open = i + 1 - dts.get_loc(r.entry_date)
+    exit_ = ("market filter" if MARKET_FILTER == "liquidate" and not mkt_ok else
+             "F-Score below min" if not FEAT["fscore"][i, j] >= F_EXIT else
+             "time limit" if MAX_HOLD_DAYS and bars_held_at_open >= MAX_HOLD_DAYS else
+             "take profit (SMA200)" if TP_MODE == "close" and FEAT["close"][i, j] >= FEAT["sma200"][i, j] else None)
+    holdings.append(dict(symbol=r.ticker, sector=r.sector, entry_date=f"{r.entry_date:%Y-%m-%d}",
+                         entry_price=num_(r.entry_px), last_close=num_(FEAT["close"][i, j]),
+                         take_profit=num_(FEAT["sma200"][i, j]) if TP_MODE == "limit" else None,
+                         stop=num_(r.entry_px * (1 - STOP_LOSS)) if STOP_LOSS else None, exit=exit_))
+kept = [h for h in holdings if not h["exit"]]
+slots = maxp - len(kept)
+picks = []
+if slots > 0 and (MARKET_FILTER is None or mkt_ok):
+    with np.errstate(invalid="ignore"):
+        ok = FEAT["base"][i] & FEAT["above"][prm["sma_fast"]][i] & (FEAT["fscore"][i] >= fmin)
+        if ENTRY_TRIGGER == "upgrade":
+            ok &= FEAT["fscore_prev"][i] < F_EXIT
+    cand = np.flatnonzero(ok)
+    C_, S2, MC_, FS_ = FEAT["close"][i], FEAT["sma200"][i], FEAT["mcap"][i], FEAT["fscore"][i]
+    if RANK_BY == "upside":
+        cand = cand[np.argsort(-(S2[cand] / C_[cand]), kind="stable")]
+    elif RANK_BY == "fscore":
+        cand = cand[np.lexsort((-MC_[cand], -FS_[cand]))]
+    else:
+        cand = cand[np.argsort(-MC_[cand], kind="stable")]
+    used = Counter(sec[tick.index(h["symbol"])] for h in kept)
+    kept_set = {h["symbol"] for h in kept}
+    for j in cand:
+        if tick[j] in kept_set or (cap and used[sec[j]] >= cap):
+            continue
+        w = 1.0
+        if prm["sizing"] == "inverse_vol" and FEAT["vol"][i, j] > 0 and np.isfinite(FEAT["vol_ref"][i]):
+            w = float(np.clip(FEAT["vol_ref"][i] / FEAT["vol"][i, j], *VOL_WEIGHT_BOUNDS))
+        picks.append(dict(symbol=tick[j], sector=sec_names[sec[j]], weight=w / maxp, last_close=num_(C_[j]),
+                          take_profit=num_(S2[j])))
+        used[sec[j]] += 1
+        if len(picks) >= slots + 3:              # the entries plus three backups
+            break
+signal = {
+    "strategy": "sma_piotroski", "kind": "stock_picks", "selected": label(prm),
+    "as_of": f"{dts[i]:%Y-%m-%d}", "generated": f"{pd.Timestamp.now():%Y-%m-%dT%H:%M:%S}", "source": meta["source"],
+    "max_positions": int(maxp), "position_weight": 1.0 / maxp, "market_ok": mkt_ok,
+    "holdings": holdings, "buys": picks[:max(slots, 0)], "backups": picks[max(slots, 0):],
+    "execution": "Exits and entries at the next open (market-on-open). Skip an entry that opens at or above its "
+                 "take-profit and take the next backup. Positions are sized once, at entry, and never rebalanced."
+                 + (" Take-profit: a sell limit at each holding's SMA200, re-entered daily." if TP_MODE == "limit" else ""),
+}
+SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+(SIGNALS_DIR / "sma_piotroski.json").write_text(json.dumps(signal, indent=2))
+print(f"Next open: {sum(bool(h['exit']) for h in holdings)} exits, {len(signal['buys'])} entries "
+      f"({', '.join(b['symbol'] for b in signal['buys']) or 'none'}), {len(kept)} holdings kept"
+      f"{'' if mkt_ok else '; market filter is risk-off'} -> {(SIGNALS_DIR / 'sma_piotroski.json').resolve()}")

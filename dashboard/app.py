@@ -22,6 +22,7 @@ from pcon import allocation as A  # noqa: E402
 from pcon import charts as C  # noqa: E402
 from pcon import expectations as E  # noqa: E402
 from pcon import metrics as M  # noqa: E402
+from pcon import orders as O  # noqa: E402
 from pcon.backtests import tests_summary  # noqa: E402
 from pcon.book import Book  # noqa: E402
 from pcon.config import CASH_SLEEVE  # noqa: E402
@@ -74,25 +75,7 @@ def cached_explore(R: pd.DataFrame, rf: pd.Series, methods: tuple, rebalance: st
 def cached_methods(R: pd.DataFrame, rf: pd.Series, lo: float, hi: float, target: pd.Series,
                    budgets: pd.Series | None, rebalance: str, wf_days: int, step: str,
                    n_resamples: int) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    W, rows, wf = {}, {}, {}
-    for m in A.METHODS:
-        if m == "risk_budget" and budgets is None:
-            continue
-        w = A.optimize(R, m, rf, lo, hi, target, n_resamples, budgets=budgets)
-        W[m] = w
-        r = A.portfolio_returns(R, w, rebalance)
-        s = A.stats_row(r, rf)
-        if m in ("equal", "target"):
-            r_wf, turnover = r.iloc[wf_days:], 0.0
-        else:
-            r_wf, Wh = A.walk_forward(R, m, rf, wf_days, step, rebalance, lo, hi, target, 30, budgets)
-            turnover = A.weight_turnover(Wh)
-        s_wf = A.stats_row(r_wf, rf)
-        rows[m] = {**s, **{f"WF {k}": v for k, v in s_wf.items() if k in ("CAGR", "Sharpe", "Max drawdown",
-                                                                             "Calmar")},
-                   "Weight turnover / quarter": turnover}
-        wf[m] = r_wf
-    return pd.DataFrame(W).T, pd.DataFrame(rows).T, wf
+    return A.compare_methods(R, rf, lo, hi, target, budgets, rebalance, wf_days, step, n_resamples)
 
 
 @st.cache_data(show_spinner="Bootstrapping weight uncertainty ...", max_entries=16)
@@ -154,25 +137,31 @@ def num(v, d=2):
 
 
 def table(df: pd.DataFrame, fmt, style=None, **kwargs):
-    """``st.dataframe(df.style.format(fmt))`` with missing numbers shown as '–'.
+    """``st.dataframe(df.style.format(fmt))`` with missing values shown as '–'.
 
-    Streamlit draws a null cell as a grey 'None' whatever the Styler's ``na_rep``, so a float column with gaps is
-    sent as text ('–' in the gaps, numbers still formatted by ``fmt`` and right-aligned). ``style`` gets the Styler
-    and the original numeric frame, for colouring rules.
+    Streamlit draws a null cell as a grey 'None' whatever the Styler's ``na_rep``, so a column with gaps is sent
+    as text: '–' in the gaps, the other cells formatted by ``fmt`` and right-aligned. ``style(styler, df)`` gets the
+    original frame, so colouring rules should read their values from ``df``.
     """
-    gaps = [c for c in df.columns if df[c].dtype.kind in "fO" and df[c].isna().any()]
-    shown = df.astype({c: object for c in gaps})
-    for c in gaps:
-        shown[c] = shown[c].where(df[c].notna(), "–")
     fmt = fmt if isinstance(fmt, dict) else {c: fmt for c in df.columns}
 
-    def safe(f):
-        return lambda v: v if isinstance(v, str) else f.format(v) if isinstance(f, str) else f(v)
-    sty = shown.style.format({c: safe(f) for c, f in fmt.items() if c in shown.columns})
+    def render(f, v):
+        return v if isinstance(v, str) else f.format(v) if isinstance(f, str) else f(v) if f else str(v)
+    gaps = [c for c in df.columns if df[c].dtype.kind in "fO" and df[c].isna().any()]
+    shown = df.copy()
+    for c in gaps:
+        shown[c] = ["–" if pd.isna(v) else render(fmt.get(c), v) for v in df[c]]
+    sty = shown.style.format({c: (lambda v, f=f: render(f, v)) for c, f in fmt.items()
+                              if c in shown.columns and c not in gaps})
     if style is not None:
         sty = style(sty, df)
     config = {c: st.column_config.Column(alignment="right") for c in gaps} | kwargs.pop("column_config", {})
     st.dataframe(sty, column_config=config, **kwargs)
+
+
+def numeric_bg(df: pd.DataFrame, fn):
+    """Styler.apply callback that colours each cell from the numeric value in ``df``."""
+    return lambda _: df.map(lambda v: fn(v) if isinstance(v, (int, float, np.floating)) else "")
 
 
 def diverging_bg(v, lim: float = 0.4) -> str:
@@ -304,7 +293,7 @@ with st.expander(f"Health checks: {LEVEL_ICON['red']} {n_red} red · {LEVEL_ICON
     for h in health:
         st.markdown(f"{LEVEL_ICON[h['level']]} **{h['scope']}**: {h['msg']}")
 
-tabs = st.tabs(["Overview", "Strategies", "Expected vs actual", "Portfolio construction", "Risk",
+tabs = st.tabs(["Overview", "Orders", "Strategies", "Expected vs actual", "Portfolio construction", "Risk",
                 "Positions & trades", "Transactions", "Journal & data"])
 
 
@@ -390,6 +379,129 @@ def page_overview():
 # ------------------------------------------------------------------------------------------------
 # 2. strategies
 # ------------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
+# orders
+# ------------------------------------------------------------------------------------------------
+ORDER_HELP = {
+    "At the close": "market-on-close (MOC) order, or as close to the close as you can, on the day the signal is "
+                    "computed. The regime filter only trades on its monthly date; momentum trades the day it flips.",
+    "Market on open": "market-on-open order at the next session's open (SMA / Piotroski exits and entries).",
+    "Limit, day": "sell limit at the take-profit price, valid for the day; enter it again each morning (the "
+                  "SMA200 moves).",
+    "Stop, day": "sell stop at the stop-loss price, valid for the day.",
+}
+
+
+def page_orders():
+    st.markdown("What to trade next. Each strategy's **latest signal** (exported by its research notebook) is sized to "
+                "the capital the **allocation** gives it, then compared with what its sleeve holds today. Orders of the "
+                "same timing are netted across strategies.")
+    ctx = allocation_context()
+    options = ([f"Best Sharpe ({A.METHODS[ctx['rec']]})"] if ctx else []) + ["Your target weights (portfolio.yaml)"]
+    c1, c2 = st.columns([1.4, 1])
+    with c1:
+        how = st.radio("Split the account between strategies by", options, horizontal=True,
+                       help="Best Sharpe is the Portfolio construction recommendation: the method with the best "
+                            "walk-forward (out-of-sample) Sharpe. It needs the three backtest exports.")
+    weights = (ctx["W"].loc[ctx["rec"]] if how.startswith("Best") else cfg.target_weights()).reindex(SIDS).fillna(0.0)
+    nav_now = float(L.nav.iloc[-1].sum()) if not L.empty else 0.0
+    with c2:
+        account = st.number_input(f"Account value ({cfg.currency})", min_value=0.0, value=float(round(nav_now, 2)),
+                                  step=1000.0, help="Defaults to the book's NAV from your journal. Change it to size "
+                                                    "orders for money you are about to deposit.")
+    invest = 1.0
+    if cfg.allocation.target_vol and ctx:
+        invest = min(invest_fraction(A.portfolio_returns(ctx["R"], weights.reindex(ctx["R"].columns).fillna(0.0),
+                                                         rebalance), cfg.allocation.target_vol,
+                                     cfg.allocation.vol_cap), 1.0)
+        st.caption(f"Volatility targeting ({cfg.allocation.target_vol:.0%}): **{invest:.0%}** of the account goes to "
+                   f"the strategies, {1 - invest:.0%} stays in T-bills.")
+    if not ctx:
+        st.info("No best-Sharpe allocation yet: it needs the backtest exports (`backtests/`). Using your target weights.")
+
+    # ---- capital per strategy ----------------------------------------------------------------
+    navs = L.nav.iloc[-1] if not L.empty else pd.Series(dtype=float)
+    rows = []
+    for s_ in SIDS:
+        sig = book.signals.get(s_)
+        rows.append({"Strategy": LABELS[s_], "Weight": weights.get(s_, 0.0) * invest,
+                     "Capital": account * invest * weights.get(s_, 0.0), "Sleeve now": float(navs.get(s_, 0.0)),
+                     "Signal as of": f"{sig['as_of']:%Y-%m-%d}" if sig else "missing"})
+    capdf = pd.DataFrame(rows).set_index("Strategy")
+    capdf["Transfer"] = capdf["Capital"] - capdf["Sleeve now"]
+    st.subheader("1 · Capital per strategy")
+    table(capdf[["Weight", "Capital", "Sleeve now", "Transfer", "Signal as of"]],
+          {"Weight": "{:.0%}", "Capital": lambda v: money(v, cur), "Sleeve now": lambda v: money(v, cur),
+           "Transfer": lambda v: money(v, cur)})
+    if (capdf["Transfer"].abs() > max(1.0, 0.01 * account)).any():
+        st.caption("Sleeves are bookkeeping inside one brokerage account: record the *Transfer* column with **Move "
+                   "money between strategies** (or deposits) in the Transactions tab, so each strategy's record "
+                   "starts from the capital it trades with.")
+
+    plans = book.order_plans(weights, account, invest)
+    missing = [s_ for s_ in SIDS if s_ not in book.signals]
+
+    # ---- netted orders -----------------------------------------------------------------------
+    st.subheader("2 · Orders to place")
+    net = O.net_orders(plans)
+    if not plans:
+        st.info("No signals yet. Re-run each research notebook with its export cell from `strategy_exports/`: the cell "
+                "writes `signals/<strategy>.json` next to `backtests/`.")
+    elif net.empty:
+        st.success("No orders: every strategy already holds what its signal says.")
+    else:
+        stale = [LABELS[s_] for s_, g in book.signals.items() if O.is_stale(g)]
+        if stale:
+            st.warning(f"Signals for {', '.join(stale)} are out of date: re-run those notebooks (with fresh data) "
+                       "and their export cells before trading.", icon="⚠️")
+        shown = net.rename(columns={"symbol": "Symbol", "side": "Side", "quantity": "Quantity", "order": "Order",
+                                    "limit": "Limit / stop", "price": "Last price", "value": "≈ Value",
+                                    "strategies": "Strategies"})
+        shown["Strategies"] = shown["Strategies"].map(lambda x: ", ".join(LABELS.get(v, v) for v in x.split(", ")))
+        table(shown, {"Quantity": "{:,.0f}", "Limit / stop": "{:,.2f}", "Last price": "{:,.2f}",
+                      "≈ Value": lambda v: money(v, cur)}, hide_index=True,
+              style=lambda sty, d: sty.map(lambda v: f"color: {T['div'][2]}; font-weight: 600" if v == "BUY" else
+                                          f"color: {T['div'][0]}; font-weight: 600" if v == "SELL" else "",
+                                          subset=["Side"]))
+        for kind in shown["Order"].unique():
+            if kind in ORDER_HELP:
+                st.caption(f"**{kind}**: {ORDER_HELP[kind]}")
+        st.caption("After filling, log each fill in **Journal & data** under the strategy shown, so every sleeve keeps "
+                   "its own record. Quantities are whole shares at the last close; check them against the live price.")
+
+    # ---- per strategy ------------------------------------------------------------------------
+    st.subheader("3 · By strategy")
+    for p_ in plans:
+        sig = book.signals[p_.strategy]
+        age = O.staleness(sig)
+        with st.expander(f"{LABELS[p_.strategy]} · {money(p_.capital, cur)} · {p_.status}", expanded=True):
+            st.markdown(f"Signal from the close of **{sig['as_of']:%a %d %b %Y}**"
+                        + (f" ({age} trading days old{', out of date' if O.is_stale(sig) else ''})" if age > 1 else "")
+                        + (f" · {sig['selected']}" if sig.get("selected") else ""))
+            if sig.get("execution"):
+                st.caption(sig["execution"])
+            a, b = st.columns([1, 1.2])
+            with a:
+                if len(p_.targets):
+                    fmt = {c_: "{:.1%}" for c_ in ("target weight", "current weight")} | \
+                          {c_: "{:,.0f}" for c_ in ("target quantity", "current quantity", "your quantity")} | \
+                          {"price": "{:,.2f}"}
+                    table(p_.targets, fmt, hide_index=True)
+            with b:
+                if len(p_.orders):
+                    table(p_.orders.drop(columns=["strategy"]), {"quantity": "{:,.0f}", "limit": "{:,.2f}",
+                                                                 "price": "{:,.2f}", "value": "{:,.0f}"},
+                          hide_index=True)
+                else:
+                    st.caption("No orders for this strategy.")
+            for n_ in p_.notes:
+                st.markdown(f"- {n_}")
+    for s_ in missing:
+        st.info(f"**{LABELS[s_]}**: no signal file (`signals/{s_}.json`). Re-run its notebook with the updated export "
+                "cell from `strategy_exports/`.")
+
+
+
 def page_strategies():
     st.subheader("Live performance")
     ls = book.live_summary()
@@ -600,19 +712,43 @@ def page_expected():
 # ------------------------------------------------------------------------------------------------
 # 4. portfolio construction
 # ------------------------------------------------------------------------------------------------
-def page_construction():
+def allocation_context() -> dict | None:
+    """Return matrix, every method's weights and the recommended method (shared by Construction and Orders)."""
     R = book.alloc_matrix(source)
     if R.shape[1] < 2 or len(R) < 300:
-        st.info("Portfolio construction needs at least two strategies with overlapping daily returns (about a year "
-                "or more). Export the backtests into `backtests/` (see `strategy_exports/`)."
-                + (f" Currently: {R.shape[1]} strategies, {len(R)} common days." if len(R) else ""))
-        return
+        return None
     rf = book.rf.reindex(R.index).fillna(0.0)
     target = cfg.target_weights().reindex(R.columns).fillna(0.0)
     budgets = cfg.risk_budgets()
     budgets = budgets.reindex(R.columns).fillna(0.0) if budgets is not None else None
     lo = cfg.allocation.min_weight
     wf_days = int(wf_years * 252)
+    W, stats_m, wf = cached_methods(R, rf, lo, max_w, target, budgets, rebalance, wf_days, "Q",
+                                    cfg.allocation.bootstrap_samples)
+    rec = A.recommend(stats_m)
+    return dict(R=R, rf=rf, target=target, budgets=budgets, lo=lo, wf_days=wf_days, W=W, stats_m=stats_m, wf=wf,
+                rec=rec)
+
+
+def invest_fraction(r: pd.Series, tv: float | None, cap: float) -> float:
+    """Share of the book in the strategies under volatility targeting (1 when it is off)."""
+    if not tv or not len(r):
+        return 1.0
+    sig_now = float(np.sqrt((r ** 2).ewm(halflife=cfg.allocation.vol_halflife).mean().iloc[-1] * 252))
+    return float(min(cap, tv / sig_now)) if sig_now > 0 else 1.0
+
+
+def page_construction():
+    ctx = allocation_context()
+    if ctx is None:
+        R = book.alloc_matrix(source)
+        st.info("Portfolio construction needs at least two strategies with overlapping daily returns (about a year "
+                "or more). Export the backtests into `backtests/` (see `strategy_exports/`)."
+                + (f" Currently: {R.shape[1]} strategies, {len(R)} common days." if len(R) else ""))
+        return
+    R, rf, target, budgets, lo, wf_days = (ctx[k] for k in ("R", "rf", "target", "budgets", "lo", "wf_days"))
+    W, stats_m, wf, rec = ctx["W"], ctx["stats_m"], ctx["wf"], ctx["rec"]
+    best_wf = stats_m["WF Sharpe"].astype(float).idxmax()
     n = R.shape[1]
     lo_used, hi_used, relaxed = A.feasible_bounds(n, lo, max_w)
     if relaxed:
@@ -624,10 +760,6 @@ def page_construction():
                f"weights {lo_used:.0%}-{hi_used:.0%}. Walk-forward = weights estimated on the trailing "
                f"{wf_years:g} years only, held for the next quarter.")
 
-    W, stats_m, wf = cached_methods(R, rf, lo, max_w, target, budgets, rebalance, wf_days, "Q",
-                                    cfg.allocation.bootstrap_samples)
-    best_wf = stats_m["WF Sharpe"].astype(float).idxmax()
-    rec = "resampled" if stats_m.loc["resampled", "WF Sharpe"] >= stats_m.loc[best_wf, "WF Sharpe"] - 0.05 else best_wf
     r_t = A.portfolio_returns(R, W.loc["target"], rebalance)
     r_r = A.portfolio_returns(R, W.loc[rec], rebalance)
 
@@ -755,9 +887,9 @@ def page_construction():
                "Share of variance from benchmark beta": f"Share of variance that is {cfg.benchmark} beta"})
     a, b = st.columns([1, 1])
     with a:
-        table(dtab.astype(float), "{:.2f}",
-              style=lambda sty, d: sty.format(lambda v: v if isinstance(v, str) else f"{v:.0%}",
-                                              subset=pd.IndexSlice[[d.index[-1]], :]))
+        shown_d = dtab.astype(float).apply(lambda row: row.map(
+            lambda v: "–" if not np.isfinite(v) else f"{v:.0%}" if row.name == dtab.index[-1] else f"{v:.2f}"), axis=1)
+        table(shown_d, {}, column_config={c_: st.column_config.Column(alignment="right") for c_ in shown_d.columns})
         enb = dv_t.get("Effective number of bets", np.nan)
         st.caption(f"With {n} strategies the maximum is {n} bets. *Effective number of bets* (Meucci) counts "
                    "independent sources of variance; *diversification ratio* = average strategy vol / portfolio "
@@ -808,7 +940,7 @@ def page_construction():
         full[cfg.benchmark] = book.bench
     stt = A.stress_test(full).astype(float)
     if len(stt):
-        table(stt, "{:.1%}", style=lambda sty, d: sty.map(diverging_bg, lim=0.4))
+        table(stt, "{:.1%}", style=lambda sty, d: sty.apply(numeric_bg(d, lambda v: diverging_bg(v, 0.4)), axis=None))
 
     # ---- portfolio risk level ----------------------------------------------------------------
     st.subheader("4 · Portfolio risk level: volatility targeting")
@@ -836,7 +968,7 @@ def page_construction():
                                           "Max drawdown": "{:.1%}", "Calmar": "{:.2f}", "Worst month": "{:.1%}"}))
         e_t = expo["Your targets"]
         sig_now = float(np.sqrt((r_t ** 2).ewm(halflife=cfg.allocation.vol_halflife).mean().iloc[-1] * 252))
-        invest_now = float(min(cap, tv / sig_now)) if sig_now > 0 else 1.0
+        invest_now = invest_fraction(r_t, tv, cap)
         chart(C.lines(pd.DataFrame({"Exposure of the target mix": e_t}), {"Exposure of the target mix": "portfolio"},
                       T, "Share of the book invested in the strategies", yfmt=".0%", height=220), "pc_vt")
         st.markdown(f"**Today:** forecast volatility of your target mix is **{sig_now:.1%}**, so a {tv:.0%} target "
@@ -1221,7 +1353,7 @@ def page_journal():
                f"`{cfg.root / 'backtests'}`. Editing them in Excel works too; the dashboard reloads on save.")
 
 
-for tab, page in zip(tabs, [page_overview, page_strategies, page_expected, page_construction, page_risk,
+for tab, page in zip(tabs, [page_overview, page_orders, page_strategies, page_expected, page_construction, page_risk,
                             page_positions, page_transactions, page_journal]):
     with tab:
         page()

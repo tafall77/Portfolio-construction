@@ -144,6 +144,46 @@ def cmd_allocate(a):
              if "Share of variance from benchmark beta" in d else ""))
 
 
+def cmd_orders(a):
+    from . import allocation as A
+    from . import orders as O
+    from .book import Book
+    b = Book(a.workspace)
+    if not b.signals:
+        sys.exit("No signals yet: run each notebook's export cell (strategy_exports/), which writes signals/.")
+    al = b.cfg.allocation
+    weights = b.cfg.target_weights()
+    how = "target weights"
+    if a.weights == "best":
+        R = b.alloc_matrix("backtest")
+        if R.shape[1] >= 2 and len(R) >= 300:
+            rf = b.rf.reindex(R.index).fillna(0.0)
+            tgt = weights.reindex(R.columns).fillna(0.0)
+            budgets = b.cfg.risk_budgets()
+            budgets = budgets.reindex(R.columns).fillna(0.0) if budgets is not None else None
+            W, stats, _ = A.compare_methods(R, rf, al.min_weight, al.max_weight, tgt, budgets, al.rebalance,
+                                            int(al.walk_forward_lookback_years * 252), "Q", al.bootstrap_samples)
+            rec = A.recommend(stats)
+            weights, how = W.loc[rec], f"best Sharpe ({A.METHODS[rec]})"
+        else:
+            print("Backtests missing or too short for the best-Sharpe allocation: using target weights.")
+    account = a.account if a.account is not None else float(b.ledger.nav.iloc[-1].sum()) if not b.ledger.empty else 0.0
+    print(f"Account {account:,.0f} split by {how}: "
+          + ", ".join(f"{b.label(k)} {v:.0%}" for k, v in weights.items()) + "\n")
+    plans = b.order_plans(weights, account)
+    for p in plans:
+        sig = b.signals[p.strategy]
+        print(f"{b.label(p.strategy)} ({p.capital:,.0f}): {p.status}  [signal {sig['as_of']:%Y-%m-%d}"
+              f"{', OUT OF DATE' if O.is_stale(sig) else ''}]")
+        for n in p.notes:
+            print(f"   - {n}")
+    net = O.net_orders(plans)
+    print("\nOrders to place:" if len(net) else "\nNo orders: every strategy holds what its signal says.")
+    if len(net):
+        print(_fmt_table(net.assign(strategies=net["strategies"].map(
+            lambda x: ", ".join(b.label(v) for v in x.split(", ")))).round(2)))
+
+
 def cmd_dashboard(a):
     args = [sys.executable, "-m", "streamlit", "run", str(ROOT / "dashboard" / "app.py")]
     if a.workspace:
@@ -192,6 +232,12 @@ def main(argv=None):
         if name == "allocate":
             s.add_argument("--source", default="backtest", choices=["backtest", "backtest+live", "live"])
         s.set_defaults(fn=fn)
+    s = sub.add_parser("orders", help="today's orders from the latest signals and the allocation")
+    s.add_argument("--workspace", default=str(DEFAULT_WS))
+    s.add_argument("--weights", default="best", choices=["best", "target"],
+                   help="split the account by the best-Sharpe allocation (default) or your target weights")
+    s.add_argument("--account", type=float, default=None, help="account value (default: the book's NAV)")
+    s.set_defaults(fn=cmd_orders)
     s = sub.add_parser("dashboard")
     s.add_argument("--workspace", default=None)
     s.set_defaults(fn=cmd_dashboard)

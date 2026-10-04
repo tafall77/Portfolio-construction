@@ -24,6 +24,17 @@ No cell picks a configuration by hand, and none re-optimises. Each cell also wri
   * momentum: the 9-check scorecard of section 11 plus the pre-sample holdout;
 * the notebook's verdict and the out-of-sample start date.
 
+Each cell also writes **`signals/<strategy>.json`** next to `backtests/`, for the dashboard's *Orders* tab:
+
+| Strategy | Signal |
+|---|---|
+| `regime_filter` | The weights to hold now (the last monthly decision, as SPY / QQQ / cash), plus the live section's allocation for the next monthly trade date. Map the sleeves to other symbols with `TRADE_AS`. |
+| `rolling_momentum` | SPY 100 % (or QQQ with `MARKET = "Nasdaq-100"`) when the selected lookback's return is positive at the last close, otherwise cash; plus the momentum value. |
+| `sma_piotroski` | The model account's next open, using `run_backtest`'s own rules: the holdings, which of them exit and why, the entries that fill the free slots (ranking, sector cap, market filter, sizing), three backups, and each holding's take-profit level. With `LIVE_START` set it follows the account opened on your first live day. |
+
+Re-run with fresh data before trading: the signal is only as recent as the last close in the notebook (set
+`REFRESH_DATA = True` / `CONFIG["refresh_data"] = True`). `PCON_SIGNALS` overrides the folder.
+
 The dashboard shows this record on each strategy (*Strategies* tab, *Journal & data → Data status*, and the
 Overview scoreboard). It raises an amber health check when the exported configuration failed a final test or
 is not the notebook's own pick. Failing a test is information, not an automatic veto: for example, a

@@ -9,7 +9,7 @@ hand. It currently runs three strategies, each researched in its own repository:
 | `regime_filter` | Macro regime filter: unemployment × policy-rate cycle (SPX / NDX / T-bills) | Regime-filter |
 | `rolling_momentum` | Rolling time-series momentum (index / T-bills) | Rolling-momentum |
 
-It answers three questions:
+It answers four questions:
 
 1. **How am I actually doing?** Your fills and cash flows are rebuilt into one *sleeve* per strategy, with its
    own cash, positions, NAV and time-weighted returns. The total portfolio is the sum of the sleeves. You get
@@ -22,6 +22,9 @@ It answers three questions:
    add/remove verdict, using the Sharpe hurdle and a bootstrap significance test. Eight allocation methods are
    compared in-sample *and* walk-forward. The page ends with a recommended allocation and the dollar transfers
    that get you there.
+4. **What do I trade next?** The *Orders* tab takes each strategy's latest signal (exported by its notebook),
+   gives each strategy its share of the account under the best-Sharpe allocation, and lists the share orders
+   that bring your holdings there, netted across strategies.
 
 ---
 
@@ -51,8 +54,10 @@ python -m pcon init                     # creates data/ from templates/workspace
      account, the test-window winning rule, or the frozen lookback that survived the gates.
    * It writes `data/backtests/<strategy>.csv` with the returns, plus a selection record with the final
      tests and the verdict, which the dashboard displays.
+   * It also writes `data/signals/<strategy>.json`: what that strategy should hold now (and, for the SMA
+     account, its next-open exits, entries and take-profit limits). The *Orders* tab reads it.
 
-   The *Portfolio construction* and *Expected vs actual* tabs work from this point on.
+   The *Portfolio construction*, *Expected vs actual* and *Orders* tabs work from this point on.
 3. **Fund the sleeves.** Log a deposit per strategy in the *Transactions* tab, or deposit into `cash` (the
    unallocated sleeve) and move money to the strategies with transfers:
    ```bash
@@ -76,8 +81,8 @@ machine. If you make the repository private and want the journal versioned, remo
 
 | When | What |
 |---|---|
-| After each fill | Log it (form, CLI or CSV). Prices refresh from Yahoo Finance automatically (cached for 6 h). |
-| Weekly / monthly | Re-run the research notebooks with fresh data and their export cells: the *live vs model* panels then cover your live dates. |
+| Each trading day, after the close | Re-run the notebooks with fresh data and their export cells, then open **Orders** (or `python -m pcon orders`). Momentum and the SMA account can trade any day; the regime filter only on the first trading day of the month. |
+| After each fill | Log it (form, CLI or CSV) under the strategy the order came from. Prices refresh from Yahoo Finance automatically (cached for 6 h). |
 | Whenever money moves | *Transactions*: record deposits and withdrawals, or edit the table if something was logged wrong. |
 | Monthly / quarterly | *Portfolio construction → Rebalance*: transfers between sleeves to get back to target. Log them with *Move money between strategies*. |
 | Whenever an alert is red | *Expected vs actual*: is it bad luck (inside the cone), an execution problem (shortfall vs model), or a broken edge (outside the cone, Sharpe test significant)? |
@@ -88,6 +93,7 @@ machine. If you make the repository private and want the journal versioned, remo
 
 | Tab | Contents |
 |---|---|
+| **Orders** | What to trade next. Pick the allocation (best Sharpe, or your targets) and the account value. You get the capital per strategy and the transfers between sleeves; the orders to place, netted by symbol, with order type (at the close, market on open, take-profit limit) and approximate value; and, per strategy, the signal date, target vs current holdings, orders and notes (scheduled monthly switch, model holdings you missed, backups, market filter). Out-of-date signals are flagged. |
 | **Overview** | NAV, P&L, YTD/MTD, live Sharpe, drawdown and exposure tiles. Cumulative return of the portfolio, each sleeve and the benchmark, with drawdowns. Actual vs target allocation. Health checks. A scoreboard per strategy with the percentile vs expectation and the shortfall vs model. |
 | **Strategies** | The full live metric table (CAGR, vol, Sharpe, Sortino, Calmar, VaR/CVaR, beta, alpha, capture, PSR ...). Per strategy: live vs model curves, drawdown, monthly heatmap, exposure, open positions, closed trades and trade statistics. A backtest tearsheet of the expectation window. |
 | **Expected vs actual** | The live path inside the backtest's 25-75 % / 5-95 % expectation cone, projected 12 months forward. Percentiles and status for return, volatility, Sharpe and drawdown. Histograms of the simulated distributions with the actual value marked. Sharpe consistency (z-test, PSR, minimum track record). Backtest profile vs live. Next-12-month risk in currency. Live vs model tracking: implementation shortfall, tracking error, correlation. |
@@ -97,7 +103,9 @@ machine. If you make the repository private and want the journal versioned, remo
 | **Transactions** | Capital in and out. Shows total deposited, withdrawn and net invested, NAV, and P&L on your money. It gives both your **money-weighted return** (XIRR, which counts when you added or removed money) and the time-weighted return. NAV vs net invested over time, deposits and withdrawals per month, quarter or year, and capital by strategy (deposits, withdrawals, net transfers, dividends, fees). Forms to record deposits, withdrawals, income and fees, plus a *move money between strategies* form. An **editable table of every cash movement**: fix, add or delete rows, then save. Rows are validated first and the previous file is kept as `.bak`. |
 | **Journal & data** | A form to log fills and an editable table of every fill, saved the same way. Data status (which backtests are loaded, their windows, whether they cover the live period). Price sources and warnings, including transfers that don't net to zero. |
 
-The same analytics run headless: `python -m pcon summary`, `python -m pcon capital` and `python -m pcon allocate`.
+The same analytics run headless: `python -m pcon summary`, `python -m pcon capital`, `python -m pcon allocate` and
+`python -m pcon orders` (`--weights target` to use your target weights, `--account 50000` to size for a different
+amount).
 
 ---
 
@@ -145,6 +153,13 @@ The same analytics run headless: `python -m pcon summary`, `python -m pcon capit
 * **Rebalance.** Tolerance-band rebalancing: nothing trades until a sleeve drifts more than `alerts.weight_drift` from its target, then every sleeve goes back to target.
 * **Diagnostics.** Correlations (daily, monthly, and on the benchmark's worst 10 % days), rolling correlations, Euler risk contributions, contributions to the worst drawdown (adding up to its depth), crisis windows measured close to close on each strategy's full backtest, and the efficient frontier within the caps.
 
+### Orders (`pcon/orders.py`)
+* **Capital per strategy** = account value × invested share (below 100 % only with volatility targeting) × the strategy's allocation weight. Sleeves are bookkeeping inside one brokerage account, so moving capital between strategies is a journal transfer, not a trade.
+* **Index strategies** (regime filter, momentum) give target weights. Orders are whole shares at the last close (futures: whole contracts). As in the backtests, a sleeve is only traded when its signal changes or it has drifted more than 10 % from target; the regime filter holds the last monthly decision until its next trade date, which the export records.
+* **SMA / Piotroski** follows the model account exactly: market-on-open exits (F-Score, time limit, market filter), market-on-open entries for the free slots in the notebook's ranking and sector cap, sized at capital ÷ max positions, and a daily take-profit limit at each holding's SMA200. Skip an entry that opens above its take-profit and buy the next backup. Positions are never trimmed or topped up.
+* **Netting.** Market orders with the same timing are netted across strategies; log the fills under each strategy's own quantity so the sleeves stay right.
+* The signals are only as fresh as the last notebook run: re-run with refreshed data before trading. A daily signal older than one trading day is flagged.
+
 ### Caveats
 * Backtests are estimates. Optimised weights inherit their errors, so prefer the walk-forward and resampled results and treat in-sample maximum-Sharpe weights as optimistic.
 * Your live record is short for a long time. The dashboard reports how uncertain each live statistic is. Read the percentiles and p-values, not only the point estimates.
@@ -160,11 +175,12 @@ trades.csv           date, strategy, symbol, side (BUY/SELL), quantity, price, f
 cashflows.csv        date, strategy, type (deposit/withdrawal/transfer/dividend/interest/fee), amount, note
 marks.csv            date, symbol, price (optional manual closes)
 backtests/*.csv      date, return[, exposure]   (from strategy_exports/)
+signals/*.json       what each strategy should hold / trade next   (from strategy_exports/)
 ```
 
 ```
 dashboard/app.py         Streamlit dashboard
-pcon/                    engine: config, journal, prices, ledger, metrics, expectations, allocation, charts, book, cli
+pcon/                    engine: config, journal, prices, ledger, metrics, expectations, allocation, orders, charts, book, cli
 strategy_exports/        cells that export each research notebook's returns
 templates/workspace/     the portfolio.yaml that `python -m pcon init` copies
 tests/                   pytest suite (accounting identities, splits, futures, TWR, optimisers vs brute force, walk-forward causality, audit regressions, app smoke test)
