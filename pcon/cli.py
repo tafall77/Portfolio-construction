@@ -184,6 +184,17 @@ def cmd_orders(a):
             lambda x: ", ".join(b.label(v) for v in x.split(", ")))).round(2)))
 
 
+def cmd_update(a):
+    from . import runner
+    ws = Path(a.workspace)
+    if a.contact:
+        runner.save_settings(ws, sec_contact=a.contact)
+    st = runner.update_all(ws, a.only)
+    bad = [k for k, v in st["results"].items() if (not a.only or k in a.only) and not v["ok"]]
+    print("\nAll strategies updated." if not bad else f"\nFailed: {', '.join(bad)}. Logs: {runner.update_dir(ws)}")
+    sys.exit(1 if bad else 0)
+
+
 def cmd_dashboard(a):
     args = [sys.executable, "-m", "streamlit", "run", str(ROOT / "dashboard" / "app.py")]
     if a.workspace:
@@ -232,6 +243,11 @@ def main(argv=None):
         if name == "allocate":
             s.add_argument("--source", default="backtest", choices=["backtest", "backtest+live", "live"])
         s.set_defaults(fn=fn)
+    s = sub.add_parser("update", help="run the strategy notebooks on fresh data -> backtests/ and signals/")
+    s.add_argument("--workspace", default=str(DEFAULT_WS))
+    s.add_argument("--only", nargs="*", default=None, help="strategy ids (default: all)")
+    s.add_argument("--contact", default=None, help='SEC contact, "Your Name you@example.org" (saved)')
+    s.set_defaults(fn=cmd_update)
     s = sub.add_parser("orders", help="today's orders from the latest signals and the allocation")
     s.add_argument("--workspace", default=str(DEFAULT_WS))
     s.add_argument("--weights", default="best", choices=["best", "target"],

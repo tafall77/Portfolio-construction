@@ -95,6 +95,10 @@ signal = {
     "execution": "Monthly. Trade at the close on the first trading day of the month; hold (weights drift) "
                  "until the next one. Cash = T-bills.",
 }
+last_px = {sym: float(prices[sym].dropna().iloc[-1]) for sym in TRADE_AS.values()
+           if isinstance(prices.get(sym), pd.Series) and prices[sym].notna().any()}
+if last_px:
+    signal["prices"] = last_px                       # fallback when the dashboard cannot reach Yahoo
 if "live_alloc" in globals() and RULE in live_alloc:
     nxt = pd.bdate_range((pd.Period(str(now), "M") + 1).start_time, periods=1)[0]
     signal.update(next_weights=as_weights(live_alloc[RULE]), next_trade=f"{nxt:%Y-%m-%d}",
@@ -103,6 +107,7 @@ else:
     print("NOTE: run the notebook's live section first to include next month's allocation.")
 SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
 (SIGNALS_DIR / "regime_filter.json").write_text(json.dumps(signal, indent=2))
-print(f"Signal: hold {signal['weights'] or 'cash'}"
-      + (f"; from {signal['next_trade']}: {signal['next_weights'] or 'cash'}" if "next_trade" in signal else "")
+pretty = lambda w: ", ".join(f"{k} {v:.0%}" for k, v in w.items()) or "cash"
+print(f"Signal: hold {pretty(signal['weights'])}"
+      + (f"; from {signal['next_trade']}: {pretty(signal['next_weights'])}" if "next_trade" in signal else "")
       + f"  -> {(SIGNALS_DIR / 'regime_filter.json').resolve()}")
