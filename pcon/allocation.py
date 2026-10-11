@@ -45,6 +45,14 @@ METHODS = {
     "max_sharpe": "Maximum Sharpe",
     "resampled": "Resampled max Sharpe",
 }
+try:                                     # optional: skfolio adds hierarchical risk parity and minimum CVaR
+    import skfolio  # noqa: F401
+    HAS_SKFOLIO = True
+    METHODS = {**{k: v for k, v in METHODS.items() if k not in ("max_sharpe", "resampled")},
+               "hrp": "Hierarchical risk parity", "min_cvar": "Minimum CVaR (95%)",
+               "max_sharpe": METHODS["max_sharpe"], "resampled": METHODS["resampled"]}
+except ImportError:
+    HAS_SKFOLIO = False
 FREQ = {"D": None, "W": "W", "M": "M", "Q": "Q", "A": "Y", "Y": "Y", "none": "none"}
 
 
@@ -356,6 +364,8 @@ def optimize(R: pd.DataFrame, method: str, rf: pd.Series | None = None, lo: floa
         return w / w.sum()
     if method == "min_cdar":
         return pd.Series(_min_cdar(R.to_numpy(float), lo, hi), index=cols)
+    if method in ("hrp", "min_cvar"):
+        return _skfolio_weights(R, method, lo, hi)
     mu, cov = estimate(R, rf)
     vol = np.sqrt(np.diag(cov))
     if method == "inverse_vol":
@@ -375,6 +385,24 @@ def optimize(R: pd.DataFrame, method: str, rf: pd.Series | None = None, lo: floa
     else:
         raise ValueError(f"unknown method {method}")
     return pd.Series(w, index=cols)
+
+
+def _skfolio_weights(R: pd.DataFrame, method: str, lo: float, hi: float) -> pd.Series:
+    """Hierarchical risk parity (Lopez de Prado; Ledoit-Wolf covariance) or minimum CVaR at 95 % (Rockafellar-
+    Uryasev), solved by skfolio within the same weight bounds as every other method."""
+    from skfolio import RiskMeasure
+    from skfolio.moments import LedoitWolf
+    from skfolio.optimization import HierarchicalRiskParity, MeanRisk
+    from skfolio.prior import EmpiricalPrior
+    lo, hi, _ = feasible_bounds(R.shape[1], lo, hi)
+    X = R.to_numpy(float)
+    if method == "hrp":
+        model = HierarchicalRiskParity(prior_estimator=EmpiricalPrior(covariance_estimator=LedoitWolf()),
+                                       min_weights=lo, max_weights=hi)
+    else:
+        model = MeanRisk(risk_measure=RiskMeasure.CVAR, min_weights=lo, max_weights=hi)
+    w = np.clip(np.asarray(model.fit(X).weights_, float), 0, None)
+    return pd.Series(_capped(w / w.sum(), lo, hi) if hi < 1 or lo > 0 else w / w.sum(), index=R.columns)
 
 
 def resampled_weights(R: pd.DataFrame, rf: pd.Series | None = None, lo: float = 0.0, hi: float = 1.0,
