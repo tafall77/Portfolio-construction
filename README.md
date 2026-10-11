@@ -19,7 +19,7 @@ It answers four questions:
    get an expectation cone, a Sharpe-consistency test, how many years of live data you need before the record
    is statistically meaningful, and a day-by-day *live vs model* comparison that isolates execution.
 3. **Which strategies, and how much of each?** Every subset of strategies is tested. Each strategy gets an
-   add/remove verdict, using the Sharpe hurdle and a bootstrap significance test. Eight allocation methods are
+   add/remove verdict, using the Sharpe hurdle and a bootstrap significance test. Twelve allocation methods are
    compared in-sample *and* walk-forward. The page ends with a recommended allocation and the dollar transfers
    that get you there.
 4. **What do I trade next?** The *Orders* tab takes each strategy's latest signal (exported by its notebook),
@@ -165,7 +165,11 @@ amount).
   | Minimum drawdown (CDaR) | Lowest average of the worst 5 % of drawdowns (conditional drawdown at risk, solved as a linear programme). |
   | Maximum Sharpe | Mean-variance (Markowitz) tangency portfolio, solved as a convex problem, so it is the global optimum within the caps. |
   | Resampled max Sharpe | The average optimum over block-bootstrap resamples (Michaud). Less sensitive to estimation error. |
+  | Hierarchical risk parity | Lopez de Prado's HRP on the Ledoit-Wolf covariance, via [skfolio](https://skfolio.org). |
+  | Minimum CVaR (95%) | Lowest average loss on the worst 5 % of days (Rockafellar-Uryasev), via skfolio. |
 * **Walk-forward.** Weights are estimated on the trailing `walk_forward_lookback_years` only, then held for the next quarter. The out-of-sample quarters are stitched together. In-sample maximum Sharpe always looks best, and the walk-forward columns show how much of that survives. The recommendation uses the best walk-forward method, preferring the resampled allocation when it is within 0.05 Sharpe of it. Its edge over your targets is tested on those **out-of-sample** returns (paired block bootstrap), not in-sample.
+* **Cross-validation check** (skfolio's `CombinatorialPurgedCV`, Lopez de Prado, *AFML* ch. 12). Walk-forward tests each method on one history; this trains every method on each combination of 8 of 10 blocks of the window and tests it on the other 2, with a purge and an embargo at the block edges. The test blocks recombine into 9 complete out-of-sample histories, so you see each method's median, worst and best Sharpe, and on how many histories it beats your targets. The dashboard says whether this agrees with the walk-forward recommendation.
+* **Cross-checked.** The tests compare the maximum-Sharpe, minimum-variance and risk-parity solvers with skfolio's independent implementations on the same inputs.
 * **Weight stability.** Bootstrap 5-95 % ranges of each method's weights, and the walk-forward turnover per quarter: a method whose weights swing wildly is mostly fitting noise.
 * **Independent bets.** The *effective number of bets* (Meucci: the number of uncorrelated sources of risk after decorrelating the sleeves), the diversification ratio, each sleeve's beta and R² to the benchmark, and the share of the book's variance that is benchmark beta. Long-only US equity strategies usually turn out to be one and a half bets at most, whatever the allocation method.
 * **Volatility targeting** (`target_vol`). Each month the book invests `min(vol_cap, target_vol / forecast vol)` in the strategies and keeps the rest in T-bills (the *Unallocated* sleeve). The forecast is an EWMA volatility (`vol_halflife`) known at the previous close, so the backtest has no look-ahead. The rebalance list includes the T-bill leg.

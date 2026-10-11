@@ -23,6 +23,7 @@ from pcon import charts as C  # noqa: E402
 from pcon import expectations as E  # noqa: E402
 from pcon import metrics as M  # noqa: E402
 from pcon import orders as O  # noqa: E402
+from pcon import robustness as RB  # noqa: E402
 from pcon import runner as RUN  # noqa: E402
 from pcon.backtests import tests_summary  # noqa: E402
 from pcon.book import Book  # noqa: E402
@@ -88,6 +89,11 @@ def cached_uncertainty(R, rf, lo, hi, budgets):
 @st.cache_data(show_spinner=False, max_entries=16)
 def cached_marginal(R, rf, method, rebalance, lo, hi, target, budgets):
     return A.marginal(R, rf, method, rebalance, lo, hi, target, budgets=budgets)
+
+
+@st.cache_data(show_spinner="Cross-validating every method on 45 train/test splits (about a minute) ...", max_entries=8)
+def cached_cpcv(R, rf, lo, hi, target, budgets):
+    return RB.cpcv_compare(R, rf, None, lo, hi, target, budgets)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -866,6 +872,41 @@ def invest_fraction(r: pd.Series, tv: float | None, cap: float) -> float:
     return float(min(cap, tv / sig_now)) if sig_now > 0 else 1.0
 
 
+def cpcv_panel(R, rf, lo, target, budgets, rec):
+    """Second out-of-sample test: combinatorial purged cross-validation (skfolio)."""
+    st.markdown("**Does the choice survive other train/test splits?** Walk-forward tests each method on one history. "
+                "Combinatorial purged cross-validation trains on every combination of 8 of 10 blocks of the window and "
+                "tests on the other 2 (with a purge and embargo at the edges), giving 9 complete out-of-sample histories.")
+    if not RB.available():
+        st.caption("Install skfolio (`pip install skfolio`, included in requirements.txt) to run this check.")
+        return
+    key = "cpcv_on"
+    if not st.session_state.get(key):
+        if st.button("Run the cross-validation check (about a minute)"):
+            st.session_state[key] = True
+            st.rerun()
+        return
+    out, S = cached_cpcv(R, rf, lo, max_w, target, budgets)
+    n = out.attrs["n_paths"]
+    shown = out.sort_values("Median Sharpe", ascending=False)
+    shown["Beats your targets"] = [f"{int(v)}/{n}" if np.isfinite(v) else "–" for v in shown["Beats your targets"]]
+    shown = shown.rename(index=A.METHODS)
+    best = A.METHODS[rec]
+    table(shown, {"Median Sharpe": "{:.2f}", "Worst Sharpe": "{:.2f}", "Best Sharpe": "{:.2f}",
+                  "Median max drawdown": "{:.1%}"}, height=38 + 35 * len(shown), width="stretch",
+          style=lambda sty, d: sty.apply(lambda row: [f"background-color: {C._rgba(C.MODEL, 0.12)}"
+                                                      if row.name == best else "" for _ in row], axis=1))
+    r_rank = int(out["Median Sharpe"].rank(ascending=False)[rec])
+    wins = out.loc[rec, "Beats your targets"]
+    verdict = ("**agrees**" if r_rank <= 3 and (rec == "target" or wins >= 0.7 * n) else "**does not clearly agree**")
+    st.markdown(f"The recommendation (*{best}*) ranks **#{r_rank} of {len(out)}** by median cross-validated "
+                f"Sharpe" + ("" if rec == "target" else f" and beats your targets on **{int(wins)} of {n}** "
+                             "histories") + f": this check {verdict} with the walk-forward pick.")
+    st.caption("Sharpe in excess of T-bills; weights held constant within each test block. Differences of a few "
+               "hundredths are noise. Uses skfolio's CombinatorialPurgedCV (Lopez de Prado, AFML ch. 12) with "
+               "this dashboard's own allocation methods, plus skfolio's hierarchical risk parity and minimum CVaR.")
+
+
 def page_construction():
     ctx = allocation_context()
     if ctx is None:
@@ -1003,6 +1044,8 @@ def page_construction():
         ser = {"Your targets": (r_t, "portfolio"), A.METHODS[rec]: (r_r, C.MODEL)}
         ser |= {LABELS[c_]: (R[c_], COLORS[c_]) for c_ in R.columns}
         chart(C.growth(ser, T, "Growth of 1 over the window (log)", log=True, height=400), "pc_growth")
+
+    cpcv_panel(R, rf, lo, target, budgets, rec)
 
     # ---- independent bets --------------------------------------------------------------------
     st.subheader("3 · How many independent bets does the book hold?")
